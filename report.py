@@ -30,6 +30,7 @@ def print_human_report(report: AnalysisReport, verbose: bool = False) -> None:
 
 def write_json_report(report: AnalysisReport, output_path: str | Path) -> None:
     path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(report.to_dict(), indent=2, sort_keys=False),
         encoding="utf-8",

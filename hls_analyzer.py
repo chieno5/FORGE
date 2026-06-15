@@ -12,6 +12,7 @@ from scorer import score_report
 
 
 DEFAULT_THRESHOLD = 60
+REPORT_DIR = Path("report")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -31,7 +32,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--json",
         dest="json_output",
-        help="Optional path for writing a structured JSON report.",
+        help="Optional JSON filename. Reports are always written under ./report/.",
     )
     parser.add_argument(
         "--verbose",
@@ -67,11 +68,19 @@ def main(argv: list[str] | None = None) -> int:
     print_human_report(analysis_report, verbose=args.verbose)
 
     if args.json_output:
-        write_json_report(analysis_report, args.json_output)
+        json_output_path = _resolve_report_path(args.json_output)
+        write_json_report(analysis_report, json_output_path)
         print()
-        print(f"JSON report written to: {args.json_output}")
+        print(f"JSON report written to: {json_output_path}")
 
     return 0
+
+
+def _resolve_report_path(json_output: str) -> Path:
+    filename = Path(json_output).name
+    if not filename:
+        filename = "analysis_report.json"
+    return REPORT_DIR / filename
 
 
 if __name__ == "__main__":

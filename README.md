@@ -22,6 +22,8 @@ python hls_analyzer.py examples/matmul.c --threshold 60 --json matmul_report.jso
 python hls_analyzer.py examples/vision_pipeline.c --threshold 60 --json vision_pipeline_report.json --verbose
 ```
 
+When `--json` is used, JSON reports are always written under the project `report/` folder. For example, `--json vision_pipeline_report.json` writes `report/vision_pipeline_report.json`.
+
 ## Use In PyCharm
 
 1. Open this folder as the PyCharm project: `C:\Users\ASUS\PycharmProjects\CtoVitisGenerator`.
@@ -39,7 +41,7 @@ python -m pip install -r requirements.txt
    - Parameters: `examples\vision_pipeline.c --threshold 60 --json vision_pipeline_report.json --verbose`
    - Working directory: `C:\Users\ASUS\PycharmProjects\CtoVitisGenerator`
 
-6. Run the configuration. The terminal will show the human-readable report, and the JSON file will be written to the project root.
+6. Run the configuration. The terminal will show the human-readable report, and the JSON file will be written under the project `report/` folder.
 
 ## What It Detects
 
@@ -77,7 +79,7 @@ Use `--json output.json` to write structured data designed for a later AI/Vitis 
 python hls_analyzer.py examples/matmul.c --json report.json
 ```
 
-The JSON includes file metadata, threshold, function-level results, loop-level regions, features, scores, reasoning, and optimization recommendations.
+This writes `report/report.json`. The JSON includes file metadata, threshold, function-level results, loop-level regions, features, scores, reasoning, and optimization recommendations.
 
 ## Limitations
 
