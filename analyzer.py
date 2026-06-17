@@ -32,6 +32,7 @@ UNSUPPORTED_CALLS = {
 
 @dataclass
 class FeatureState:
+    # 这里集中保存一个函数或循环区域的统计结果。
     function_name: str
     function_names_in_file: set[str]
     loop_count: int = 0
@@ -58,6 +59,7 @@ class FeatureState:
     has_recursion: bool = False
 
     def to_features(self) -> dict[str, Any]:
+        # 将原始计数整理成后续评分和报告需要的特征字典。
         return {
             "loop_count": self.loop_count,
             "for_loop_count": self.for_loop_count,
@@ -96,6 +98,7 @@ class FeatureState:
 
 
 class FeatureVisitor(c_ast.NodeVisitor):
+    # 遍历 AST 节点，统计循环、数组访问、算术操作等信息。
     def __init__(self, state: FeatureState, initial_loop_depth: int = 0):
         self.state = state
         self.loop_depth = initial_loop_depth
@@ -133,6 +136,7 @@ class FeatureVisitor(c_ast.NodeVisitor):
 
     def visit_Assignment(self, node: c_ast.Assignment) -> None:
         self.state.assignment_count += 1
+        # += 或者 x = x + ... 这类形式，先按归约模式处理。
         if node.op in {"+=", "-=", "*=", "/="}:
             self.state.has_reduction_pattern = True
             if node.op == "+=" and _contains_multiplication(node.rvalue):
@@ -182,6 +186,7 @@ class FeatureVisitor(c_ast.NodeVisitor):
         self.generic_visit(node)
 
     def _visit_loop(self, node: c_ast.Node) -> None:
+        # 进入循环时增加深度，离开时恢复，用来计算最大嵌套层数。
         self.loop_depth += 1
         self.state.max_loop_depth = max(self.state.max_loop_depth, self.loop_depth)
         self.generic_visit(node)
@@ -189,6 +194,7 @@ class FeatureVisitor(c_ast.NodeVisitor):
 
 
 def analyze_functions(parsed_functions: list[ParsedFunction]) -> list[FunctionAnalysis]:
+    # 函数名集合用于区分“文件内函数调用”和“外部未知调用”。
     function_names = {function.name for function in parsed_functions}
     return [_analyze_function(function, function_names) for function in parsed_functions]
 
@@ -201,6 +207,7 @@ def _analyze_function(
     state.parameter_pointer_count = sum(1 for param in function.parameters if "*" in param)
     FeatureVisitor(state).visit(function.node.body)
 
+    # 除了函数整体，也单独记录每个循环区域。
     loop_regions = _extract_loop_regions(function, function_names)
     return FunctionAnalysis(
         name=function.name,
@@ -221,6 +228,7 @@ def _extract_loop_regions(
 
 
 class LoopCollector(c_ast.NodeVisitor):
+    # 收集函数中的每个循环，并分别计算它们自己的特征。
     def __init__(self, function_name: str, function_names: set[str]):
         self.function_name = function_name
         self.function_names = function_names
@@ -298,6 +306,7 @@ def _node_key(node: c_ast.Node) -> str | None:
 
 
 def _is_regular_array_ref(node: c_ast.ArrayRef) -> bool:
+    # 简单判断 A[i]、A[i + 1]、A[y * width + x] 这类规则访问。
     if not _is_regular_subscript(node.subscript):
         return False
     parent = node.name

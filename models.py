@@ -6,7 +6,7 @@ from typing import Any
 
 @dataclass
 class LoopRegion:
-    """Analysis result for a loop-level computational region."""
+    """循环区域的分析结果。"""
 
     id: str
     kind: str
@@ -24,7 +24,7 @@ class LoopRegion:
 
 @dataclass
 class FunctionAnalysis:
-    """Analysis result for a C function treated as a top-level module."""
+    """函数级分析结果。"""
 
     name: str
     return_type: str
@@ -45,7 +45,7 @@ class FunctionAnalysis:
 
 @dataclass
 class AnalysisReport:
-    """Top-level report designed for CLI output and future AI integration."""
+    """完整分析报告。"""
 
     file: str
     threshold: int

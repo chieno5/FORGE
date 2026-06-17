@@ -8,6 +8,7 @@ from models import AnalysisReport, FunctionAnalysis, LoopRegion
 
 
 def print_human_report(report: AnalysisReport, verbose: bool = False) -> None:
+    # 控制台报告保持简洁，详细结构化数据交给 JSON。
     print("HLS Static Analysis Report")
     print("=" * 80)
     print(f"File: {report.file}")
@@ -22,7 +23,7 @@ def print_human_report(report: AnalysisReport, verbose: bool = False) -> None:
         _print_function(function, verbose)
         print()
 
-    print("Limitations")
+    print("Notes")
     print("-" * 80)
     for limitation in report.limitations:
         print(f"- {limitation}")
@@ -30,6 +31,7 @@ def print_human_report(report: AnalysisReport, verbose: bool = False) -> None:
 
 def write_json_report(report: AnalysisReport, output_path: str | Path) -> None:
     path = Path(output_path)
+    # 自动创建 report/ 目录。
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(report.to_dict(), indent=2, sort_keys=False),
@@ -46,7 +48,7 @@ def _print_function(function: FunctionAnalysis, verbose: bool) -> None:
     _print_features(function.features)
     print("Reasoning:")
     print(f"  {function.reasoning}")
-    print("Suggested next-stage optimisation directions:")
+    print("Suggested optimisation directions:")
     for recommendation in function.recommendations:
         print(f"  - {recommendation}")
 

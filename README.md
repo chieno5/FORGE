@@ -1,20 +1,20 @@
-# C to Vitis HLS Static Analyzer MVP
+# C to Vitis HLS Static Analyzer
 
-This project is a first-stage Python CLI tool for static analysis of C code that may be suitable for AMD Vitis HLS / FPGA acceleration. It does not call AI APIs, run Vitis HLS, or rewrite source code. It only parses C code, extracts explainable features, scores functions and loop regions, and emits terminal and JSON reports.
+一个用于分析 C 代码的命令行小工具。它会识别函数和循环，提取一些静态特征，并给出 FPGA/HLS 加速适配度评分。
 
-## Install
+## 安装
 
 ```powershell
 pip install -r requirements.txt
 ```
 
-If you use the project virtual environment on Windows:
+如果使用项目里的虚拟环境：
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-## Run
+## 运行
 
 ```powershell
 python hls_analyzer.py examples/vector_add.c
@@ -22,67 +22,73 @@ python hls_analyzer.py examples/matmul.c --threshold 60 --json matmul_report.jso
 python hls_analyzer.py examples/vision_pipeline.c --threshold 60 --json vision_pipeline_report.json --verbose
 ```
 
-When `--json` is used, JSON reports are always written under the project `report/` folder. For example, `--json vision_pipeline_report.json` writes `report/vision_pipeline_report.json`.
+使用 `--json` 时，报告会统一写入 `report/` 文件夹。例如：
 
-## Use In PyCharm
+```powershell
+python hls_analyzer.py examples/vision_pipeline.c --json vision_pipeline_report.json
+```
 
-1. Open this folder as the PyCharm project: `C:\Users\ASUS\PycharmProjects\CtoVitisGenerator`.
-2. Open `Settings` -> `Project` -> `Python Interpreter`.
-3. Select an existing Python interpreter or recreate the `.venv` if PyCharm reports that it is broken.
-4. Install the dependency from PyCharm Terminal:
+输出位置：
+
+```text
+report/vision_pipeline_report.json
+```
+
+## 在 PyCharm 中运行
+
+1. 用 PyCharm 打开项目目录。
+2. 在 `Settings` -> `Project` -> `Python Interpreter` 中选择解释器。
+3. 在 PyCharm Terminal 中安装依赖：
 
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
-5. Create a Run Configuration:
-   - Type: `Python`
-   - Script path: `C:\Users\ASUS\PycharmProjects\CtoVitisGenerator\hls_analyzer.py`
-   - Parameters: `examples\vision_pipeline.c --threshold 60 --json vision_pipeline_report.json --verbose`
-   - Working directory: `C:\Users\ASUS\PycharmProjects\CtoVitisGenerator`
+4. 创建 Python Run Configuration：
 
-6. Run the configuration. The terminal will show the human-readable report, and the JSON file will be written under the project `report/` folder.
+```text
+Script path:
+C:\Users\ASUS\PycharmProjects\CtoVitisGenerator\hls_analyzer.py
 
-## What It Detects
+Parameters:
+examples\vision_pipeline.c --threshold 60 --json vision_pipeline_report.json --verbose
 
-- Function definitions, names, return types, and parameters
-- `for`, `while`, and `do while` loops
-- Loop-level sub-regions
-- Maximum nested loop depth
-- Array access counts and simple regular access patterns such as `A[i]` and `A[i][j]`
-- Assignments, arithmetic operations, multiplication, reductions, and MAC-like patterns
-- Function calls, unknown calls, recursion, dynamic memory, stdio, and file I/O signals
-- Compute-heavy versus control-heavy structure
+Working directory:
+C:\Users\ASUS\PycharmProjects\CtoVitisGenerator
+```
 
-## Scoring
+## 当前会分析的内容
 
-Scores range from 0 to 100. Higher values mean the module looks more promising for FPGA/HLS exploration.
+- 函数定义
+- 函数参数
+- `for` / `while` 循环
+- 循环嵌套深度
+- 数组访问
+- 算术操作
+- 乘法、MAC、归约模式
+- 函数调用
+- `malloc`、`printf`、文件 I/O、递归等不适合 HLS 的结构
 
-Positive signals include loops, nested loops, arithmetic density, multiplication or MAC patterns, regular array access, and simple loop-based computation.
+## 评分说明
 
-Negative signals include `printf` or file I/O, dynamic memory, recursion, possible complex pointer usage, control-heavy logic, and many unknown function calls.
+分数范围是 0 到 100。分数越高，越适合作为 FPGA/HLS 加速候选。
 
-Classification thresholds:
+分类规则：
 
 - `score >= 75`: `HIGH_PRIORITY_FPGA_CANDIDATE`
 - `score >= 50`: `MEDIUM_PRIORITY_FPGA_CANDIDATE`
 - `score >= 30`: `LOW_PRIORITY_OR_CPU_SUITABLE`
 - `score < 30`: `NOT_SUITABLE_FOR_HLS`
 
-The `--threshold` value controls whether a module is marked as a candidate in the report. It does not change the classification bands.
+`--threshold` 用来决定是否把模块标记为候选模块，不改变上面的分类规则。
 
-## JSON Output
+## 示例
 
-Use `--json output.json` to write structured data designed for a later AI/Vitis HLS design-space exploration stage.
+示例代码在 `examples/` 目录下：
 
-```powershell
-python hls_analyzer.py examples/matmul.c --json report.json
-```
+- `vector_add.c`
+- `matmul.c`
+- `control_heavy.c`
+- `vision_pipeline.c`
 
-This writes `report/report.json`. The JSON includes file metadata, threshold, function-level results, loop-level regions, features, scores, reasoning, and optimization recommendations.
-
-## Limitations
-
-This MVP uses static heuristics. It cannot perfectly partition arbitrary C programs into CPU and FPGA modules. It is intended to identify potential acceleration candidates and explain why they received their scores.
-
-The parser uses `pycparser` and targets a simplified HLS-style C subset. Real-world C files with preprocessor-heavy code, system includes, compiler extensions, or complex pointer logic may need cleanup before analysis.
+其中 `vision_pipeline.c` 更适合用来完整查看函数分析、循环分析、评分和 JSON 报告。

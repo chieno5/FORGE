@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Iterable
 
 try:
     from pycparser import c_ast, c_parser
@@ -15,7 +14,7 @@ else:
 
 
 class CParserError(RuntimeError):
-    """Raised when a C source file cannot be parsed for analysis."""
+    """C 文件解析失败时抛出。"""
 
 
 class ParsedFunction:
@@ -47,15 +46,17 @@ def parse_c_file(path: str | Path) -> ParsedCFile:
     raw_source = source_path.read_text(encoding="utf-8")
     cleaned_source = _prepare_source_for_pycparser(raw_source)
 
+    # pycparser 更适合处理已经去掉宏和 include 的 C 代码。
     parser = c_parser.CParser()
     try:
         ast = parser.parse(cleaned_source, filename=str(source_path))
-    except Exception as exc:  # pycparser raises ParseError, but keep this wrapper stable.
+    except Exception as exc:
         raise CParserError(
-            "Failed to parse C file. This MVP supports a simplified HLS-style C subset. "
+            "Failed to parse C file. This tool supports a simplified HLS-style C subset. "
             "Try removing unsupported preprocessor directives, system includes, or compiler extensions."
         ) from exc
 
+    # 当前把每个函数定义视为一个顶层分析模块。
     functions = [
         ParsedFunction(ext, raw_source)
         for ext in ast.ext
@@ -65,6 +66,7 @@ def parse_c_file(path: str | Path) -> ParsedCFile:
 
 
 def _prepare_source_for_pycparser(source: str) -> str:
+    # 做一层轻量清理，减少 pycparser 被预处理语法卡住的概率。
     source = _remove_comments(source)
     source = _remove_preprocessor_lines(source)
     source = _remove_common_c_qualifiers(source)

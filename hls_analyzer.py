@@ -18,8 +18,7 @@ REPORT_DIR = Path("report")
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Static C analyzer for identifying potential FPGA/Vitis HLS "
-            "acceleration candidates."
+            "Analyze C code and score potential FPGA/HLS acceleration candidates."
         )
     )
     parser.add_argument("input", help="Path to the C source file to analyze.")
@@ -46,6 +45,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     threshold = min(100, max(0, args.threshold))
 
+    # 先解析 C 文件，再把 AST 交给分析器提取特征。
     try:
         parsed = parse_c_file(args.input)
     except CParserError as exc:
@@ -59,15 +59,15 @@ def main(argv: list[str] | None = None) -> int:
         threshold=threshold,
         functions=functions,
         limitations=[
-            "This MVP uses static heuristics and does not perfectly partition arbitrary C programs into CPU and FPGA modules.",
-            "Parsing targets a simplified HLS-style C subset; preprocessing, compiler extensions, and complex C constructs may require cleanup first.",
-            "Scores are explainable estimates intended to guide later Vitis HLS and AI-driven design-space exploration.",
+            "Scores are based on static heuristics.",
+            "Complex C syntax may need cleanup before analysis.",
         ],
     )
 
     print_human_report(analysis_report, verbose=args.verbose)
 
     if args.json_output:
+        # JSON 统一写入 report/，避免散落在项目根目录。
         json_output_path = _resolve_report_path(args.json_output)
         write_json_report(analysis_report, json_output_path)
         print()
@@ -77,6 +77,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _resolve_report_path(json_output: str) -> Path:
+    # 即使用户传入子目录，也只取文件名，统一放到 report/ 下。
     filename = Path(json_output).name
     if not filename:
         filename = "analysis_report.json"
