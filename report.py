@@ -8,23 +8,55 @@ from models import AnalysisReport, FunctionAnalysis, LoopRegion
 
 
 def print_human_report(report: AnalysisReport, verbose: bool = False) -> None:
-    # 控制台报告保持简洁，详细结构化数据交给 JSON。
-    print("HLS Static Analysis Report")
-    print("=" * 80)
+    # 默认只显示模块摘要，完整特征保存在 JSON 中。
+    print("FORGE Analysis Summary")
+    print("=" * 72)
     print(f"File: {report.file}")
     print(f"Candidate threshold: {report.threshold}")
-    print()
 
     if not report.functions:
+        print()
         print("No C function definitions were found.")
         return
 
-    for function in report.functions:
-        _print_function(function, verbose)
-        print()
+    loop_count = sum(
+        function.features.get("loop_count", 0) for function in report.functions
+    )
+    candidate_count = sum(function.is_candidate for function in report.functions)
+    best_function = max(report.functions, key=lambda function: function.score)
 
+    print(
+        f"Functions: {len(report.functions)} | "
+        f"Loops: {loop_count} | Candidates: {candidate_count}"
+    )
+    print()
+    print("Modules")
+    print("-" * 72)
+    for function in report.functions:
+        candidate = "yes" if function.is_candidate else "no"
+        loops = function.features.get("loop_count", 0)
+        print(
+            f"- {function.name}: {function.score}/100 | "
+            f"{function.classification} | loops={loops} | candidate={candidate}"
+        )
+
+    print()
+    print(
+        f"Highest score: {best_function.name} "
+        f"({best_function.score}/100, {best_function.classification})"
+    )
+
+    if not verbose:
+        return
+
+    print()
+    print("Detailed Analysis")
+    print("=" * 72)
+    for function in report.functions:
+        _print_function(function, verbose=True)
+        print()
     print("Notes")
-    print("-" * 80)
+    print("-" * 72)
     for limitation in report.limitations:
         print(f"- {limitation}")
 
@@ -35,6 +67,16 @@ def write_json_report(report: AnalysisReport, output_path: str | Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(report.to_dict(), indent=2, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
+def write_data_report(data: dict[str, Any], output_path: str | Path) -> None:
+    """写入 AI 推荐或方案生成报告。"""
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
 

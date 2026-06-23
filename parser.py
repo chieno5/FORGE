@@ -75,7 +75,13 @@ def _prepare_source_for_pycparser(source: str) -> str:
 
 
 def _remove_comments(source: str) -> str:
-    source = re.sub(r"/\*.*?\*/", "", source, flags=re.DOTALL)
+    # 保留块注释中的换行，确保 AST 行号仍能对应原始代码。
+    source = re.sub(
+        r"/\*.*?\*/",
+        lambda match: "\n" * match.group(0).count("\n"),
+        source,
+        flags=re.DOTALL,
+    )
     return re.sub(r"//.*", "", source)
 
 

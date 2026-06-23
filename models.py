@@ -12,6 +12,7 @@ class LoopRegion:
     kind: str
     depth: int
     features: dict[str, Any]
+    source_line: int = 0
     score: int = 0
     classification: str = ""
     is_candidate: bool = False
@@ -30,6 +31,7 @@ class FunctionAnalysis:
     return_type: str
     parameters: list[str]
     features: dict[str, Any]
+    source_line: int = 0
     score: int = 0
     classification: str = ""
     is_candidate: bool = False

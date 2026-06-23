@@ -214,6 +214,7 @@ def _analyze_function(
         return_type=function.return_type,
         parameters=function.parameters,
         features=state.to_features(),
+        source_line=function.node.decl.coord.line if function.node.decl.coord else 0,
         loop_regions=loop_regions,
     )
 
@@ -257,6 +258,7 @@ class LoopCollector(c_ast.NodeVisitor):
                 kind=kind,
                 depth=self.loop_depth,
                 features=state.to_features(),
+                source_line=node.coord.line if node.coord else 0,
             )
         )
         self.generic_visit(node)
