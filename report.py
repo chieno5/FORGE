@@ -8,7 +8,6 @@ from models import AnalysisReport, FunctionAnalysis, LoopRegion
 
 
 def print_human_report(report: AnalysisReport, verbose: bool = False) -> None:
-    # 默认只显示模块摘要，完整特征保存在 JSON 中。
     print("FORGE Analysis Summary")
     print("=" * 72)
     print(f"File: {report.file}")
@@ -53,7 +52,7 @@ def print_human_report(report: AnalysisReport, verbose: bool = False) -> None:
     print("Detailed Analysis")
     print("=" * 72)
     for function in report.functions:
-        _print_function(function, verbose=True)
+        _print_function(function)
         print()
     print("Notes")
     print("-" * 72)
@@ -63,7 +62,6 @@ def print_human_report(report: AnalysisReport, verbose: bool = False) -> None:
 
 def write_json_report(report: AnalysisReport, output_path: str | Path) -> None:
     path = Path(output_path)
-    # 自动创建 report/ 目录。
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(report.to_dict(), indent=2, sort_keys=False),
@@ -72,7 +70,6 @@ def write_json_report(report: AnalysisReport, output_path: str | Path) -> None:
 
 
 def write_data_report(data: dict[str, Any], output_path: str | Path) -> None:
-    """写入 AI 推荐或方案生成报告。"""
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -81,7 +78,7 @@ def write_data_report(data: dict[str, Any], output_path: str | Path) -> None:
     )
 
 
-def _print_function(function: FunctionAnalysis, verbose: bool) -> None:
+def _print_function(function: FunctionAnalysis) -> None:
     print(f"Function: {function.name}")
     print(f"Score: {function.score} / 100")
     print(f"Classification: {function.classification}")
@@ -97,16 +94,15 @@ def _print_function(function: FunctionAnalysis, verbose: bool) -> None:
     if function.loop_regions:
         print("Loop-level regions:")
         for region in function.loop_regions:
-            _print_loop_region(region, verbose)
+            _print_loop_region(region)
 
 
-def _print_loop_region(region: LoopRegion, verbose: bool) -> None:
+def _print_loop_region(region: LoopRegion) -> None:
     print(f"  Region: {region.id} ({region.kind}, depth {region.depth})")
     print(f"  Score: {region.score} / 100")
     print(f"  Classification: {region.classification}")
-    if verbose:
-        print("  Features:")
-        _print_features(region.features, indent="    ")
+    print("  Features:")
+    _print_features(region.features, indent="    ")
     print(f"  Reasoning: {region.reasoning}")
 
 

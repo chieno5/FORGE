@@ -7,7 +7,7 @@ from pathlib import Path
 
 try:
     from dotenv import load_dotenv
-except ImportError:  # 静态分析模式不强制依赖 .env 支持。
+except ImportError:  # Static analysis does not require .env support.
     load_dotenv = None
 
 from ai_recommender import (
@@ -95,6 +95,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--testbench",
         help="Optional C/C++ testbench copied into baseline and every solution.",
     )
+    parser.add_argument(
+        "--auto-testbench",
+        action="store_true",
+        help="Generate a local smoke testbench when --generate is used.",
+    )
     return parser
 
 
@@ -111,8 +116,13 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.auto_testbench and not args.generate:
+        print("Error: --auto-testbench is only used with --generate.", file=sys.stderr)
+        return 2
+    if args.auto_testbench and args.testbench:
+        print("Error: use either --testbench or --auto-testbench, not both.", file=sys.stderr)
+        return 2
 
-    # 先生成稳定的静态分析结果，AI 层只读取该结果，不修改评分。
     try:
         parsed = parse_c_file(args.input)
     except CParserError as exc:
@@ -177,7 +187,6 @@ def main(argv: list[str] | None = None) -> int:
         "ai": ai_result.to_dict(),
         "generated_projects": [],
     }
-    # AI 推荐先落盘；即使后续 Vitis 目录生成失败，推荐结果仍可检查。
     write_data_report(pragma_report, pragma_report_path)
 
     generated_projects = []
@@ -193,6 +202,7 @@ def main(argv: list[str] | None = None) -> int:
                 part=part,
                 clock_period_ns=clock_period_ns,
                 testbench_path=args.testbench,
+                auto_testbench=args.auto_testbench,
             )
         except VitisGenerationError as exc:
             print(f"Vitis generation error: {exc}", file=sys.stderr)
@@ -224,10 +234,10 @@ def _select_top_function(
     requested: str | None,
 ) -> str:
     if not functions:
-        raise ValueError("输入文件中没有可分析的 C 函数。")
+        raise ValueError("No analyzable C functions were found in the input file.")
     if requested:
         if not any(function.name == requested for function in functions):
-            raise ValueError(f"找不到指定的顶层函数: {requested}")
+            raise ValueError(f"Requested top function was not found: {requested}")
         return requested
     return max(functions, key=lambda function: function.score).name
 
@@ -238,12 +248,11 @@ def _clock_from_environment() -> float:
         return float(raw_value)
     except ValueError as exc:
         raise VitisGenerationError(
-            f"FORGE_VITIS_CLOCK_NS 不是有效数字: {raw_value}"
+            f"FORGE_VITIS_CLOCK_NS is not a valid number: {raw_value}"
         ) from exc
 
 
 def _resolve_report_path(json_output: str) -> Path:
-    # 即使传入子目录，也只取文件名，统一写入 report/。
     filename = Path(json_output).name or "analysis_report.json"
     return REPORT_DIR / filename
 

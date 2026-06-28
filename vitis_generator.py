@@ -9,10 +9,11 @@ from typing import Any
 
 from ai_recommender import OptimizationSolution, PragmaDirective
 from models import AnalysisReport, FunctionAnalysis, LoopRegion
+from testbench_generator import generate_local_testbench
 
 
 class VitisGenerationError(RuntimeError):
-    """Vitis 方案无法生成时抛出。"""
+    """Raised when Vitis project files cannot be generated."""
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,7 @@ class GeneratedProject:
     source_file: str
     tcl_script: str
     testbench: str | None
+    testbench_generated: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -41,26 +43,31 @@ def generate_vitis_projects(
     part: str = "xc7z020clg400-1",
     clock_period_ns: float = 10.0,
     testbench_path: str | Path | None = None,
+    auto_testbench: bool = False,
 ) -> list[GeneratedProject]:
-    """生成一个 baseline 和三套多 pragma Vitis HLS 工程。"""
     source = Path(source_path)
     if not source.exists():
-        raise VitisGenerationError(f"源文件不存在: {source}")
+        raise VitisGenerationError(f"Source file does not exist: {source}")
     if not re.fullmatch(r"[A-Za-z_]\w*", top_function):
-        raise VitisGenerationError(f"顶层函数名无效: {top_function}")
+        raise VitisGenerationError(f"Invalid top function name: {top_function}")
     if not re.fullmatch(r"[A-Za-z0-9_.+\-]+", part):
-        raise VitisGenerationError(f"器件型号格式无效: {part}")
+        raise VitisGenerationError(f"Invalid FPGA part format: {part}")
     if clock_period_ns <= 0:
-        raise VitisGenerationError("时钟周期必须大于 0。")
+        raise VitisGenerationError("Clock period must be greater than 0.")
     if len(solutions) != 3:
-        raise VitisGenerationError("必须提供恰好三套优化方案。")
+        raise VitisGenerationError("Exactly three optimisation solutions are required.")
+    if testbench_path and auto_testbench:
+        raise VitisGenerationError("Use either --testbench or --auto-testbench, not both.")
 
-    testbench = Path(testbench_path) if testbench_path else None
-    if testbench and not testbench.exists():
-        raise VitisGenerationError(f"测试文件不存在: {testbench}")
-
-    _find_function(report, top_function)
+    top_analysis = _find_function(report, top_function)
     original_source = source.read_text(encoding="utf-8")
+    testbench = _resolve_testbench(
+        source=source,
+        source_text=original_source,
+        top_analysis=top_analysis,
+        testbench_path=testbench_path,
+        auto_testbench=auto_testbench,
+    )
     project_root = Path(output_root) / source.stem / factor
     generated: list[GeneratedProject] = []
 
@@ -68,7 +75,7 @@ def generate_vitis_projects(
         _write_project(
             project_dir=project_root / "baseline",
             source=source,
-            source_text=original_source,
+            source_text=_prepare_vitis_source(original_source, report, top_function),
             testbench=testbench,
             top_function=top_function,
             part=part,
@@ -85,7 +92,7 @@ def generate_vitis_projects(
             _write_project(
                 project_dir=project_root / project_name,
                 source=source,
-                source_text=transformed,
+                source_text=_prepare_vitis_source(transformed, report, top_function),
                 testbench=testbench,
                 top_function=top_function,
                 part=part,
@@ -102,7 +109,7 @@ def _write_project(
     project_dir: Path,
     source: Path,
     source_text: str,
-    testbench: Path | None,
+    testbench: TestbenchInput | None,
     top_function: str,
     part: str,
     clock_period_ns: float,
@@ -117,10 +124,15 @@ def _write_project(
     generated_source.write_text(source_text, encoding="utf-8")
 
     copied_testbench: Path | None = None
+    testbench_generated = False
     if testbench:
         tb_dir.mkdir(parents=True, exist_ok=True)
-        copied_testbench = tb_dir / testbench.name
-        shutil.copy2(testbench, copied_testbench)
+        copied_testbench = tb_dir / testbench.filename
+        if testbench.source is None:
+            shutil.copy2(testbench.path, copied_testbench)
+        else:
+            copied_testbench.write_text(testbench.source, encoding="utf-8")
+            testbench_generated = True
 
     tcl_path = project_dir / "run_hls.tcl"
     tcl_path.write_text(
@@ -148,6 +160,7 @@ def _write_project(
         "clock_period_ns": clock_period_ns,
         "solution": solution.to_dict() if solution else None,
         "has_testbench": copied_testbench is not None,
+        "testbench_generated": testbench_generated,
     }
     (project_dir / "project.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False),
@@ -164,7 +177,105 @@ def _write_project(
         source_file=str(generated_source),
         tcl_script=str(tcl_path),
         testbench=str(copied_testbench) if copied_testbench else None,
+        testbench_generated=testbench_generated,
     )
+
+
+@dataclass(frozen=True)
+class TestbenchInput:
+    filename: str
+    path: Path | None = None
+    source: str | None = None
+
+
+def _resolve_testbench(
+    source: Path,
+    source_text: str,
+    top_analysis: FunctionAnalysis,
+    testbench_path: str | Path | None,
+    auto_testbench: bool,
+) -> TestbenchInput | None:
+    if testbench_path:
+        path = Path(testbench_path)
+        if not path.exists():
+            raise VitisGenerationError(f"Testbench file does not exist: {path}")
+        return TestbenchInput(filename=path.name, path=path)
+    if not auto_testbench:
+        return None
+    generated = generate_local_testbench(source_text, source.stem, top_analysis)
+    return TestbenchInput(filename=generated.filename, source=generated.source)
+
+
+def _prepare_vitis_source(
+    source: str,
+    report: AnalysisReport,
+    top_function: str,
+) -> str:
+    text = _remove_non_top_main(source, report, top_function)
+    header = (
+        "/* Generated by FORGE for Vitis HLS. */\n"
+        "/* Edit the original source file for permanent changes. */\n\n"
+    )
+    return header + text.lstrip()
+
+
+def _remove_non_top_main(
+    source: str,
+    report: AnalysisReport,
+    top_function: str,
+) -> str:
+    if top_function == "main":
+        return source
+    main_function = next(
+        (function for function in report.functions if function.name == "main"),
+        None,
+    )
+    if main_function is None or main_function.source_line <= 0:
+        return source
+
+    lines = source.splitlines(keepends=True)
+    start = _find_function_start_line(lines, "main")
+    if start is None:
+        start = main_function.source_line - 1
+    if start < 0 or start >= len(lines):
+        return source
+    end = _function_end_line(lines, start)
+    if end is None:
+        return source
+    return "".join(lines[:start] + lines[end + 1 :])
+
+
+def _find_function_start_line(lines: list[str], function_name: str) -> int | None:
+    name_pattern = re.compile(rf"\b{re.escape(function_name)}\s*\(")
+    for start, line in enumerate(lines):
+        if not name_pattern.search(line):
+            continue
+        signature = ""
+        for index in range(start, min(start + 20, len(lines))):
+            signature += lines[index]
+            if ";" in signature and "{" not in signature:
+                break
+            if "{" in signature:
+                before_body = signature.split("{", 1)[0]
+                if name_pattern.search(before_body):
+                    return start
+                break
+    return None
+
+
+def _function_end_line(lines: list[str], start: int) -> int | None:
+    brace_depth = 0
+    found_body = False
+    for index in range(start, len(lines)):
+        for char in lines[index]:
+            if char == "{":
+                brace_depth += 1
+                found_body = True
+            elif char == "}":
+                brace_depth -= 1
+                if found_body and brace_depth == 0:
+                    return index
+    return None
 
 
 def _insert_pragmas(
@@ -176,7 +287,6 @@ def _insert_pragmas(
     trailing_newline = source.endswith(("\n", "\r"))
     insertions: list[tuple[int, int, str]] = []
 
-    # 先根据原始源码收集位置，再从后向前插入，避免行号漂移。
     for order, directive in enumerate(directives):
         function = _find_function(report, directive.target_function)
         if directive.target_loop_id:
@@ -184,7 +294,7 @@ def _insert_pragmas(
             insert_at = loop.source_line - 1
             if insert_at < 0 or insert_at >= len(lines):
                 raise VitisGenerationError(
-                    f"循环行号超出源文件范围: {directive.target_loop_id}"
+                    f"Loop line is outside the source range: {directive.target_loop_id}"
                 )
             indent = lines[insert_at][
                 : len(lines[insert_at]) - len(lines[insert_at].lstrip())
@@ -206,14 +316,14 @@ def _find_function(report: AnalysisReport, function_name: str) -> FunctionAnalys
         None,
     )
     if function is None:
-        raise VitisGenerationError(f"分析报告中找不到函数: {function_name}")
+        raise VitisGenerationError(f"Function not found in analysis report: {function_name}")
     return function
 
 
 def _find_loop(function: FunctionAnalysis, loop_id: str) -> LoopRegion:
     loop = next((item for item in function.loop_regions if item.id == loop_id), None)
     if loop is None:
-        raise VitisGenerationError(f"分析报告中找不到循环: {loop_id}")
+        raise VitisGenerationError(f"Loop not found in analysis report: {loop_id}")
     return loop
 
 
@@ -226,7 +336,7 @@ def _function_body_position(
         if "{" in lines[index]:
             leading = lines[index][: len(lines[index]) - len(lines[index].lstrip())]
             return index + 1, leading + "    "
-    raise VitisGenerationError(f"找不到函数体: {function.name}")
+    raise VitisGenerationError(f"Function body was not found: {function.name}")
 
 
 def _build_tcl(
@@ -240,10 +350,12 @@ def _build_tcl(
         "set script_dir [file dirname [file normalize [info script]]]",
         "open_project -reset [file join $script_dir vitis_project]",
         f"set_top {top_function}",
-        f"add_files [file join $script_dir src {{{source_name}}}]",
+        f"add_files -cflags {{-std=c99}} [file join $script_dir src {{{source_name}}}]",
     ]
     if testbench_name:
-        lines.append(f"add_files -tb [file join $script_dir tb {{{testbench_name}}}]")
+        lines.append(
+            f"add_files -tb -cflags {{-std=c99}} [file join $script_dir tb {{{testbench_name}}}]"
+        )
     lines.extend(
         [
             "open_solution -reset solution1",

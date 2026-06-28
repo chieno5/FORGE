@@ -12,7 +12,6 @@ NOT_SUITABLE = "NOT_SUITABLE_FOR_HLS"
 
 
 def score_report(functions: list[FunctionAnalysis], threshold: int) -> None:
-    # 函数和循环区域共用同一套评分逻辑。
     for function in functions:
         _score_module(function, threshold)
         for loop_region in function.loop_regions:
@@ -42,7 +41,6 @@ def _score_module(module: FunctionAnalysis | LoopRegion, threshold: int) -> None
 def _calculate_score(features: dict[str, Any]) -> int:
     score = 0
 
-    # 正向信号：循环、嵌套、算术、规则数组访问等。
     if features["loop_count"] > 0:
         score += 15
     if features["max_loop_depth"] >= 2:
@@ -64,7 +62,6 @@ def _calculate_score(features: dict[str, Any]) -> int:
     if features["has_simple_loop_based_computation"]:
         score += 10
 
-    # 负向信号：动态内存、递归、复杂指针、控制密集等。
     unsupported = set(features["unsupported_constructs"])
     if "stdio" in unsupported or "file_io" in unsupported:
         score -= 20
@@ -100,7 +97,6 @@ def _has_regular_array_arithmetic_loop(features: dict[str, Any]) -> bool:
 
 
 def _recommendations(features: dict[str, Any]) -> list[str]:
-    # 这里先给出很粗的优化方向，供后续人工判断。
     recommendations: list[str] = []
     if features["loop_count"] > 0:
         recommendations.append("pipeline")
@@ -122,7 +118,6 @@ def _reasoning(
     score: int,
     classification: str,
 ) -> str:
-    # 把评分依据整理成一段简短说明，方便阅读报告。
     positives: list[str] = []
     negatives: list[str] = []
 

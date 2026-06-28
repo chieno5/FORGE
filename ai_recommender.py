@@ -38,7 +38,7 @@ SUPPORTED_DIRECTIVES = {
 
 
 class AIRecommendationError(RuntimeError):
-    """AI 请求或返回数据无法使用时抛出。"""
+    """Raised when AI recommendation data cannot be requested or used."""
 
 
 @dataclass(frozen=True)
@@ -154,34 +154,34 @@ def recommend_solutions(
     clock_period_ns: float,
     model: str | None = None,
     client: Any | None = None,
+    experience_context: dict[str, Any] | None = None,
 ) -> AIRecommendationResult:
-    """让 AI 针对同一目标生成三套多 pragma 组合方案。"""
     if factor not in OPTIMIZATION_FACTORS:
-        raise AIRecommendationError(f"不支持的优化目标: {factor}")
+        raise AIRecommendationError(f"Unsupported optimisation factor: {factor}")
 
     selected_model = model or os.getenv("FORGE_OPENAI_MODEL", DEFAULT_MODEL)
     if client is None:
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise AIRecommendationError(
-                "未找到 OPENAI_API_KEY。请在项目 .env 或 PyCharm 环境变量中设置。"
+                "OPENAI_API_KEY was not found. Set it in .env or in the PyCharm run environment."
             )
         try:
             from openai import OpenAI
         except ImportError as exc:
             raise AIRecommendationError(
-                "缺少 openai 包，请运行 pip install -r requirements.txt。"
+                "The openai package is missing. Run: pip install -r requirements.txt"
             ) from exc
         client = OpenAI(api_key=api_key)
 
-    request_payload = {
-        "project": "FORGE: FPGA Optimization and Reconfiguration Generation Engine",
-        "top_function": top_function,
-        "optimization_factor": factor,
-        "target_part": part,
-        "clock_period_ns": clock_period_ns,
-        "static_analysis": report.to_dict(),
-    }
+    request_payload = _build_request_payload(
+        report=report,
+        top_function=top_function,
+        factor=factor,
+        part=part,
+        clock_period_ns=clock_period_ns,
+        experience_context=experience_context,
+    )
 
     try:
         response = client.responses.create(
@@ -199,12 +199,12 @@ def recommend_solutions(
         )
         raw_text = response.output_text
     except Exception as exc:
-        raise AIRecommendationError(f"OpenAI 请求失败: {exc}") from exc
+        raise AIRecommendationError(f"OpenAI request failed: {exc}") from exc
 
     try:
         payload = json.loads(raw_text)
     except (TypeError, json.JSONDecodeError) as exc:
-        raise AIRecommendationError("OpenAI 未返回有效的 JSON 推荐结果。") from exc
+        raise AIRecommendationError("OpenAI did not return valid JSON.") from exc
 
     solutions = parse_solution_payload(payload, report, top_function)
     return AIRecommendationResult(
@@ -220,38 +220,33 @@ def parse_solution_payload(
     report: AnalysisReport,
     top_function: str,
 ) -> list[OptimizationSolution]:
-    """本地校验组合方案，避免无效目标进入代码生成。"""
     if not isinstance(payload, dict):
-        raise AIRecommendationError("推荐结果的根节点必须是 JSON 对象。")
+        raise AIRecommendationError("The recommendation root must be a JSON object.")
 
     raw_solutions = payload.get("solutions")
     if not isinstance(raw_solutions, list) or len(raw_solutions) != 3:
-        raise AIRecommendationError("AI 必须返回恰好三套完整方案。")
+        raise AIRecommendationError("AI must return exactly three complete solutions.")
 
     all_functions = {function.name: function for function in report.functions}
     if top_function not in all_functions:
-        raise AIRecommendationError(f"找不到顶层函数: {top_function}")
+        raise AIRecommendationError(f"Top function was not found: {top_function}")
     reachable_names = _reachable_function_names(all_functions, top_function)
-    functions_by_name = {
-        name: all_functions[name] for name in reachable_names
-    }
+    functions_by_name = {name: all_functions[name] for name in reachable_names}
 
     solutions: list[OptimizationSolution] = []
     for raw_solution in raw_solutions:
         if not isinstance(raw_solution, dict):
-            raise AIRecommendationError("每套方案都必须是 JSON 对象。")
+            raise AIRecommendationError("Each solution must be a JSON object.")
         raw_pragmas = raw_solution.get("pragmas")
         if not isinstance(raw_pragmas, list) or len(raw_pragmas) < 2:
-            raise AIRecommendationError("每套完整方案至少需要两个 pragma。")
+            raise AIRecommendationError("Each solution must contain at least two pragmas.")
 
-        pragmas = [
-            _parse_directive(item, functions_by_name) for item in raw_pragmas
-        ]
+        pragmas = [_parse_directive(item, functions_by_name) for item in raw_pragmas]
         pragma_keys = {
             (item.target_function, item.target_loop_id, item.pragma) for item in pragmas
         }
         if len(pragma_keys) != len(pragmas):
-            raise AIRecommendationError("同一方案中存在完全重复的 pragma。")
+            raise AIRecommendationError("A solution contains duplicate pragmas.")
 
         try:
             solution = OptimizationSolution(
@@ -264,14 +259,14 @@ def parse_solution_payload(
                 pragmas=pragmas,
             )
         except (KeyError, TypeError, ValueError) as exc:
-            raise AIRecommendationError("方案字段不完整或类型错误。") from exc
+            raise AIRecommendationError("Solution fields are missing or invalid.") from exc
         if not 0 <= solution.confidence <= 1:
-            raise AIRecommendationError("confidence 必须位于 0 到 1 之间。")
+            raise AIRecommendationError("confidence must be between 0 and 1.")
         solutions.append(solution)
 
     solutions.sort(key=lambda item: (item.rank, -item.confidence))
     if [item.rank for item in solutions] != [1, 2, 3]:
-        raise AIRecommendationError("三套方案的 rank 必须分别为 1、2、3。")
+        raise AIRecommendationError("The three solution ranks must be 1, 2 and 3.")
 
     solution_keys = {
         tuple(
@@ -283,8 +278,29 @@ def parse_solution_payload(
         for solution in solutions
     }
     if len(solution_keys) != 3:
-        raise AIRecommendationError("AI 返回了内容完全相同的重复方案。")
+        raise AIRecommendationError("AI returned repeated solution content.")
     return solutions
+
+
+def _build_request_payload(
+    report: AnalysisReport,
+    top_function: str,
+    factor: str,
+    part: str,
+    clock_period_ns: float,
+    experience_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "project": "FORGE: FPGA Optimization and Reconfiguration Generation Engine",
+        "top_function": top_function,
+        "optimization_factor": factor,
+        "target_part": part,
+        "clock_period_ns": clock_period_ns,
+        "static_analysis": report.to_dict(),
+    }
+    if experience_context:
+        payload["experience_context"] = experience_context
+    return payload
 
 
 def _parse_directive(
@@ -292,7 +308,7 @@ def _parse_directive(
     functions_by_name: dict[str, Any],
 ) -> PragmaDirective:
     if not isinstance(raw_item, dict):
-        raise AIRecommendationError("pragma 条目必须是 JSON 对象。")
+        raise AIRecommendationError("Each pragma entry must be a JSON object.")
     try:
         directive = PragmaDirective(
             target_function=str(raw_item["target_function"]).strip(),
@@ -301,7 +317,7 @@ def _parse_directive(
             rationale=str(raw_item["rationale"]).strip(),
         )
     except (KeyError, TypeError, ValueError) as exc:
-        raise AIRecommendationError("pragma 字段不完整或类型错误。") from exc
+        raise AIRecommendationError("Pragma fields are missing or invalid.") from exc
     _validate_directive(directive, functions_by_name)
     return directive
 
@@ -310,7 +326,6 @@ def _reachable_function_names(
     functions_by_name: dict[str, Any],
     top_function: str,
 ) -> set[str]:
-    """只允许优化顶层函数实际可达的代码。"""
     reachable: set[str] = set()
     pending = [top_function]
     while pending:
@@ -334,18 +349,21 @@ def _validate_directive(
 ) -> None:
     target = functions_by_name.get(directive.target_function)
     if target is None:
-        raise AIRecommendationError(f"AI 推荐了不存在的函数: {directive.target_function}")
+        raise AIRecommendationError(
+            f"AI recommended a function that does not exist or is not reachable: "
+            f"{directive.target_function}"
+        )
     valid_loop_ids = {region.id for region in target.loop_regions}
     if directive.target_loop_id and directive.target_loop_id not in valid_loop_ids:
-        raise AIRecommendationError(f"AI 推荐了不存在的循环: {directive.target_loop_id}")
+        raise AIRecommendationError(f"AI recommended an unknown loop: {directive.target_loop_id}")
     if "\n" in directive.pragma or "\r" in directive.pragma:
-        raise AIRecommendationError("每个 pragma 条目只能包含一行指令。")
+        raise AIRecommendationError("Each pragma must contain one line only.")
     if not re.fullmatch(r"#pragma HLS [A-Za-z0-9_\[\].=+\- ]+", directive.pragma):
-        raise AIRecommendationError(f"pragma 格式无效: {directive.pragma}")
+        raise AIRecommendationError(f"Invalid pragma format: {directive.pragma}")
     parts = directive.pragma.split()
     name = parts[2] if len(parts) >= 3 else ""
     if name not in SUPPORTED_DIRECTIVES:
-        raise AIRecommendationError(f"当前不支持该 HLS 指令: {name}")
+        raise AIRecommendationError(f"Unsupported HLS directive: {name}")
 
 
 def _normalize_pragma(pragma: str) -> str:

@@ -14,7 +14,7 @@ else:
 
 
 class CParserError(RuntimeError):
-    """C 文件解析失败时抛出。"""
+    """Raised when a C file cannot be parsed."""
 
 
 class ParsedFunction:
@@ -46,7 +46,6 @@ def parse_c_file(path: str | Path) -> ParsedCFile:
     raw_source = source_path.read_text(encoding="utf-8")
     cleaned_source = _prepare_source_for_pycparser(raw_source)
 
-    # pycparser 更适合处理已经去掉宏和 include 的 C 代码。
     parser = c_parser.CParser()
     try:
         ast = parser.parse(cleaned_source, filename=str(source_path))
@@ -56,7 +55,6 @@ def parse_c_file(path: str | Path) -> ParsedCFile:
             "Try removing unsupported preprocessor directives, system includes, or compiler extensions."
         ) from exc
 
-    # 当前把每个函数定义视为一个顶层分析模块。
     functions = [
         ParsedFunction(ext, raw_source)
         for ext in ast.ext
@@ -66,16 +64,14 @@ def parse_c_file(path: str | Path) -> ParsedCFile:
 
 
 def _prepare_source_for_pycparser(source: str) -> str:
-    # 做一层轻量清理，减少 pycparser 被预处理语法卡住的概率。
+    source = _replace_hls_specific_tokens(source)
     source = _remove_comments(source)
     source = _remove_preprocessor_lines(source)
     source = _remove_common_c_qualifiers(source)
-    source = _replace_hls_specific_tokens(source)
     return source
 
 
 def _remove_comments(source: str) -> str:
-    # 保留块注释中的换行，确保 AST 行号仍能对应原始代码。
     source = re.sub(
         r"/\*.*?\*/",
         lambda match: "\n" * match.group(0).count("\n"),
@@ -93,16 +89,15 @@ def _remove_preprocessor_lines(source: str) -> str:
 
 
 def _remove_common_c_qualifiers(source: str) -> str:
-    replacements = {
-        r"\bconst\b": "const",
-        r"\bvolatile\b": "",
-        r"\brestrict\b": "",
-        r"\b__restrict\b": "",
-        r"\b__restrict__\b": "",
-        r"\binline\b": "",
-        r"\bstatic\s+inline\b": "static",
-    }
-    for pattern, replacement in replacements.items():
+    replacements = [
+        (r"\bstatic\s+inline\b", "static"),
+        (r"\bvolatile\b", ""),
+        (r"\brestrict\b", ""),
+        (r"\b__restrict\b", ""),
+        (r"\b__restrict__\b", ""),
+        (r"\binline\b", ""),
+    ]
+    for pattern, replacement in replacements:
         source = re.sub(pattern, replacement, source)
     return source
 
@@ -120,24 +115,29 @@ def _extract_parameters(args: "c_ast.ParamList | None") -> list[str]:
     return [_decl_to_text(param) for param in args.params]
 
 
-def _decl_to_text(node: object | None) -> str:
+def _decl_to_text(node: object | None, name: str = "") -> str:
     if node is None:
         return ""
     if c_ast is None:
         return str(node)
     if isinstance(node, c_ast.Decl):
-        return f"{_decl_to_text(node.type)} {node.name}".strip()
+        return _decl_to_text(node.type, node.name or name)
     if isinstance(node, c_ast.TypeDecl):
-        return _decl_to_text(node.type)
+        base_type = _decl_to_text(node.type)
+        qualifiers = " ".join(getattr(node, "quals", []) or [])
+        prefix = f"{qualifiers} {base_type}".strip()
+        return f"{prefix} {name}".strip()
     if isinstance(node, c_ast.IdentifierType):
         return " ".join(node.names)
     if isinstance(node, c_ast.PtrDecl):
-        return f"{_decl_to_text(node.type)}*"
+        pointer_name = f"*{name}" if name else "*"
+        return _decl_to_text(node.type, pointer_name)
     if isinstance(node, c_ast.ArrayDecl):
         dim = _expr_to_text(node.dim)
-        return f"{_decl_to_text(node.type)}[{dim}]"
+        array_name = f"{name}[{dim}]" if name else f"[{dim}]"
+        return _decl_to_text(node.type, array_name)
     if isinstance(node, c_ast.FuncDecl):
-        return _decl_to_text(node.type)
+        return _decl_to_text(node.type, name)
     return node.__class__.__name__
 
 
