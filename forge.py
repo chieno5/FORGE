@@ -13,7 +13,6 @@ except ImportError:  # Static analysis does not require .env support.
 from ai_recommender import (
     AIRecommendationError,
     DEFAULT_MODEL,
-    OPTIMIZATION_FACTORS,
     recommend_solutions,
 )
 from analyzer import analyze_functions
@@ -65,11 +64,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Generate baseline plus three complete Vitis HLS solutions.",
     )
     parser.add_argument(
-        "--factor",
-        choices=sorted(OPTIMIZATION_FACTORS),
-        help="Optimisation goal required by --ai/--generate: performance or power.",
-    )
-    parser.add_argument(
         "--model",
         help=f"OpenAI model. Default: FORGE_OPENAI_MODEL or {DEFAULT_MODEL}.",
     )
@@ -109,13 +103,6 @@ def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     threshold = min(100, max(0, args.threshold))
     needs_ai = args.ai or args.generate
-    if needs_ai and not args.factor:
-        print(
-            "Error: --factor is required with --ai or --generate "
-            "(performance or power).",
-            file=sys.stderr,
-        )
-        return 2
     if args.auto_testbench and not args.generate:
         print("Error: --auto-testbench is only used with --generate.", file=sys.stderr)
         return 2
@@ -166,7 +153,6 @@ def main(argv: list[str] | None = None) -> int:
         ai_result = recommend_solutions(
             analysis_report,
             top_function,
-            factor=args.factor,
             part=part,
             clock_period_ns=clock_period_ns,
             model=args.model or os.getenv("FORGE_OPENAI_MODEL", DEFAULT_MODEL),
@@ -180,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
         "project": PROJECT_NAME,
         "source_file": str(Path(args.input)),
         "top_function": top_function,
-        "factor": args.factor,
+        "optimization_objective": "performance_per_watt_per_lut",
         "target_part": part,
         "clock_period_ns": clock_period_ns,
         "static_report": str(static_report_path) if static_report_path else None,
@@ -197,7 +183,6 @@ def main(argv: list[str] | None = None) -> int:
                 report=analysis_report,
                 solutions=ai_result.solutions,
                 top_function=top_function,
-                factor=args.factor,
                 output_root=args.output_root,
                 part=part,
                 clock_period_ns=clock_period_ns,
@@ -214,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
     write_data_report(pragma_report, pragma_report_path)
 
     print(f"\nSelected top function: {top_function}")
-    print(f"Optimisation factor: {args.factor}")
+    print("Optimisation objective: performance_per_watt_per_lut")
     for solution in ai_result.solutions:
         print(f"{solution.rank}. {solution.name} ({len(solution.pragmas)} pragmas)")
         for directive in solution.pragmas:
@@ -224,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
     if generated_projects:
         print(
             "Baseline and Vitis solutions written under: "
-            f"{Path(args.output_root) / Path(args.input).stem / args.factor}"
+            f"{Path(args.output_root) / Path(args.input).stem}"
         )
     return 0
 

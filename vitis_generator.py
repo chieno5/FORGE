@@ -21,7 +21,6 @@ class GeneratedProject:
     kind: str
     rank: int | None
     name: str
-    factor: str
     pragmas: list[dict[str, Any]]
     directory: str
     source_file: str
@@ -38,7 +37,6 @@ def generate_vitis_projects(
     report: AnalysisReport,
     solutions: list[OptimizationSolution],
     top_function: str,
-    factor: str,
     output_root: str | Path = "generated",
     part: str = "xc7z020clg400-1",
     clock_period_ns: float = 10.0,
@@ -68,7 +66,7 @@ def generate_vitis_projects(
         testbench_path=testbench_path,
         auto_testbench=auto_testbench,
     )
-    project_root = Path(output_root) / source.stem / factor
+    project_root = Path(output_root) / source.stem
     generated: list[GeneratedProject] = []
 
     generated.append(
@@ -80,7 +78,6 @@ def generate_vitis_projects(
             top_function=top_function,
             part=part,
             clock_period_ns=clock_period_ns,
-            factor=factor,
             solution=None,
         )
     )
@@ -97,7 +94,6 @@ def generate_vitis_projects(
                 top_function=top_function,
                 part=part,
                 clock_period_ns=clock_period_ns,
-                factor=factor,
                 solution=solution,
             )
         )
@@ -113,7 +109,6 @@ def _write_project(
     top_function: str,
     part: str,
     clock_period_ns: float,
-    factor: str,
     solution: OptimizationSolution | None,
 ) -> GeneratedProject:
     src_dir = project_dir / "src"
@@ -154,7 +149,7 @@ def _write_project(
     metadata = {
         "project": "FORGE",
         "kind": "solution" if solution else "baseline",
-        "factor": factor,
+        "optimization_objective": "performance_per_watt_per_lut",
         "top_function": top_function,
         "part": part,
         "clock_period_ns": clock_period_ns,
@@ -171,7 +166,6 @@ def _write_project(
         kind="solution" if solution else "baseline",
         rank=solution.rank if solution else None,
         name=solution.name if solution else "Baseline",
-        factor=factor,
         pragmas=pragmas,
         directory=str(project_dir),
         source_file=str(generated_source),

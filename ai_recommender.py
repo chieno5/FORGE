@@ -10,7 +10,7 @@ from models import AnalysisReport
 
 
 DEFAULT_MODEL = "gpt-5.4-mini"
-OPTIMIZATION_FACTORS = {"performance", "power"}
+ENERGY_EFFICIENCY_OBJECTIVE = "maximize performance per watt per LUT after Vitis evaluation"
 SUPPORTED_DIRECTIVES = {
     "ALLOCATION",
     "ARRAY_PARTITION",
@@ -71,14 +71,12 @@ class OptimizationSolution:
 @dataclass(frozen=True)
 class AIRecommendationResult:
     model: str
-    factor: str
     summary: str
     solutions: list[OptimizationSolution]
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "model": self.model,
-            "factor": self.factor,
             "summary": self.summary,
             "solutions": [item.to_dict() for item in self.solutions],
         }
@@ -132,12 +130,12 @@ RESPONSE_SCHEMA: dict[str, Any] = {
 
 
 SYSTEM_PROMPT = """You are a Vitis HLS optimisation expert working inside FORGE.
-Create exactly three distinct whole-design solutions for the requested optimisation factor.
+Create exactly three distinct whole-design design points for energy-efficiency exploration.
 Every solution becomes a complete Vitis project and should contain 2 to 6 coordinated pragmas
 across the top function and its analyzed helper functions when the source structure supports it.
-For factor 'performance', prioritize throughput, initiation interval and latency while avoiding
-obviously infeasible resource growth. For factor 'power', prefer lower switching activity and
-resource use while retaining useful performance; HLS-level power conclusions are only proxies.
+The later selection metric will be performance per watt per LUT after Vitis reports are available.
+Balance latency, initiation interval, resource growth and expected switching activity. Do not optimize
+only for raw performance or only for low power.
 Use only valid '#pragma HLS ...' syntax and loop IDs present in the input JSON.
 Prefer PIPELINE, UNROLL, DATAFLOW, ARRAY_PARTITION, ARRAY_RESHAPE, ALLOCATION,
 BIND_OP, BIND_STORAGE, INLINE, DEPENDENCE, INTERFACE, LATENCY, STREAM or STABLE.
@@ -149,16 +147,12 @@ Make the three strategies meaningfully different and return only the requested s
 def recommend_solutions(
     report: AnalysisReport,
     top_function: str,
-    factor: str,
     part: str,
     clock_period_ns: float,
     model: str | None = None,
     client: Any | None = None,
     experience_context: dict[str, Any] | None = None,
 ) -> AIRecommendationResult:
-    if factor not in OPTIMIZATION_FACTORS:
-        raise AIRecommendationError(f"Unsupported optimisation factor: {factor}")
-
     selected_model = model or os.getenv("FORGE_OPENAI_MODEL", DEFAULT_MODEL)
     if client is None:
         api_key = os.getenv("OPENAI_API_KEY")
@@ -177,7 +171,6 @@ def recommend_solutions(
     request_payload = _build_request_payload(
         report=report,
         top_function=top_function,
-        factor=factor,
         part=part,
         clock_period_ns=clock_period_ns,
         experience_context=experience_context,
@@ -209,7 +202,6 @@ def recommend_solutions(
     solutions = parse_solution_payload(payload, report, top_function)
     return AIRecommendationResult(
         model=selected_model,
-        factor=factor,
         summary=str(payload.get("summary", "")),
         solutions=solutions,
     )
@@ -285,7 +277,6 @@ def parse_solution_payload(
 def _build_request_payload(
     report: AnalysisReport,
     top_function: str,
-    factor: str,
     part: str,
     clock_period_ns: float,
     experience_context: dict[str, Any] | None,
@@ -293,7 +284,7 @@ def _build_request_payload(
     payload: dict[str, Any] = {
         "project": "FORGE: FPGA Optimization and Reconfiguration Generation Engine",
         "top_function": top_function,
-        "optimization_factor": factor,
+        "optimization_objective": ENERGY_EFFICIENCY_OBJECTIVE,
         "target_part": part,
         "clock_period_ns": clock_period_ns,
         "static_analysis": report.to_dict(),
