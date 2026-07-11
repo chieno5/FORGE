@@ -13,6 +13,9 @@ else:
     _PYCARSER_IMPORT_ERROR = None
 
 
+LOCAL_INCLUDE_PATTERN = re.compile(r'^\s*#include\s+"([^"]+)"', re.MULTILINE)
+
+
 class CParserError(RuntimeError):
     """Raised when a C file cannot be parsed."""
 
@@ -33,7 +36,10 @@ class ParsedCFile:
         self.functions = functions
 
 
-def parse_c_file(path: str | Path) -> ParsedCFile:
+def parse_c_file(
+    path: str | Path,
+    include_dirs: list[str | Path] | None = None,
+) -> ParsedCFile:
     if c_parser is None:
         raise CParserError(
             "pycparser is required. Install it with: pip install -r requirements.txt"
@@ -44,7 +50,8 @@ def parse_c_file(path: str | Path) -> ParsedCFile:
         raise CParserError(f"Input file does not exist: {source_path}")
 
     raw_source = source_path.read_text(encoding="utf-8")
-    cleaned_source = _prepare_source_for_pycparser(raw_source)
+    expanded_source = _expand_local_includes(source_path, include_dirs or [])
+    cleaned_source = _prepare_source_for_pycparser(expanded_source)
 
     parser = c_parser.CParser()
     try:
@@ -61,6 +68,48 @@ def parse_c_file(path: str | Path) -> ParsedCFile:
         if isinstance(ext, c_ast.FuncDef)
     ]
     return ParsedCFile(source_path, ast, functions)
+
+
+def _expand_local_includes(source_path: Path, include_dirs: list[str | Path]) -> str:
+    search_dirs = [source_path.parent]
+    for directory in include_dirs:
+        path = Path(directory)
+        if not path.is_dir():
+            raise CParserError(f"Include directory does not exist: {path}")
+        search_dirs.append(path)
+    return _expand_file(source_path, search_dirs, set())
+
+
+def _expand_file(path: Path, search_dirs: list[Path], visited: set[Path]) -> str:
+    resolved_path = path.resolve()
+    if resolved_path in visited:
+        return ""
+    visited.add(resolved_path)
+    source = path.read_text(encoding="utf-8")
+
+    def replace_include(match: re.Match[str]) -> str:
+        header_name = match.group(1)
+        header = _find_local_header(header_name, path.parent, search_dirs)
+        if header is None:
+            raise CParserError(
+                f"Quoted include was not found: {header_name}. "
+                "Use --include-dir or place it beside the source."
+            )
+        return _expand_file(header, search_dirs, visited)
+
+    return LOCAL_INCLUDE_PATTERN.sub(replace_include, source)
+
+
+def _find_local_header(
+    name: str,
+    current_directory: Path,
+    search_dirs: list[Path],
+) -> Path | None:
+    for directory in [current_directory, *search_dirs]:
+        candidate = directory / name
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _prepare_source_for_pycparser(source: str) -> str:

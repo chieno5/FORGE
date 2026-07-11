@@ -156,12 +156,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    config_overrides: dict[str, Any] | None = None,
+) -> int:
     _configure_console_encoding()
     if load_dotenv is not None:
         load_dotenv()
     try:
         config = _load_configuration()
+        if config_overrides:
+            _merge_config(config, config_overrides)
     except ValueError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
@@ -207,7 +212,7 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
         return 2
 
     try:
-        parsed = parse_c_file(args.input)
+        parsed = parse_c_file(args.input, args.include_dir)
     except CParserError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
@@ -259,6 +264,8 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
             design_point_count=args.design_points,
             model=model,
             experience_context=database.history_context(application.key),
+            retry_callback=_print_ai_retry,
+            source_text=source_text,
         )
     except (AIRecommendationError, ValueError, VitisGenerationError) as exc:
         print(f"AI recommendation error: {exc}", file=sys.stderr)
@@ -639,6 +646,10 @@ def _print_ai_summary(summary: str, solutions: list[object]) -> None:
     names = ", ".join(f"{item.rank}. {item.name}" for item in solutions)
     if names:
         print(f"[FORGE] AI design points: {names}")
+
+
+def _print_ai_retry(attempt: int, error: str) -> None:
+    print(f"[FORGE] AI recommendation: retry {attempt}/3 - {error}")
 
 
 if __name__ == "__main__":

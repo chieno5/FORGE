@@ -135,10 +135,10 @@ def run_experiments(
 def select_best_result(results: Iterable[ExperimentResult]) -> ExperimentResult:
     candidates = [
         item for item in results
-        if item.kind == "solution" and item.efficiency_score is not None
+        if item.status == "completed" and item.efficiency_score is not None
     ]
     if not candidates:
-        raise VitisExecutionError("No completed design point has an efficiency_score.")
+        raise VitisExecutionError("No completed result has an efficiency_score.")
     return max(candidates, key=lambda item: item.efficiency_score or float("-inf"))
 
 

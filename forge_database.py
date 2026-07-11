@@ -169,6 +169,7 @@ class ForgeDatabase:
 
     def history_context(self, application: str, limit: int = 20) -> dict[str, Any]:
         historical_table = APPLICATION_TABLES.get(application)
+        completed_experiments: list[dict[str, Any]] = []
         if historical_table:
             historical_rows = self.connection.execute(
                 f"""
@@ -181,39 +182,30 @@ class ForgeDatabase:
                 """,
                 (limit,),
             ).fetchall()
-            if historical_rows:
-                return {
-                    "application": application,
-                    "completed_experiments": [
-                        {
-                            **dict(row),
-                            "pragmas": json.loads(row["pragma_plan_json"]).get("pragmas", []),
-                        }
-                        for row in historical_rows
-                    ],
-                }
+            completed_experiments.extend(
+                _normalise_imported_history(row) for row in historical_rows
+            )
         rows = self.connection.execute(
             """
-            SELECT dp.name, dp.kind, dp.pragmas_json, er.runtime_ns, er.power_w,
-                   er.energy_nj, er.lut, er.efficiency_score
+            SELECT dp.name, dp.kind, dp.pragmas_json, er.runtime_ns, er.performance,
+                   er.power_w, er.energy_nj, er.lut, er.efficiency_score
             FROM experiment_results er
             JOIN design_points dp ON dp.id = er.design_point_id
             JOIN analysis_runs ar ON ar.id = dp.analysis_run_id
             WHERE ar.application = ? AND er.status = 'completed'
-            ORDER BY er.created_at DESC
+            ORDER BY er.efficiency_score DESC, er.created_at DESC
             LIMIT ?
             """,
             (application, limit),
         ).fetchall()
+        completed_experiments.extend(_normalise_forge_history(row) for row in rows)
+        completed_experiments.sort(
+            key=lambda item: _score_for_history_sort(item.get("efficiency_score")),
+            reverse=True,
+        )
         return {
             "application": application,
-            "completed_experiments": [
-                {
-                    **dict(row),
-                    "pragmas": json.loads(row["pragmas_json"]),
-                }
-                for row in rows
-            ],
+            "completed_experiments": completed_experiments[:limit],
         }
 
     def import_historical_records(
@@ -358,6 +350,50 @@ class ForgeDatabase:
 def _point_key(project: dict[str, Any]) -> str:
     rank = project.get("rank")
     return "baseline" if rank is None else f"design_point_{int(rank):03d}"
+
+
+def _normalise_imported_history(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    return {
+        "source": "imported_history",
+        "name": data["name"],
+        "kind": data["kind"],
+        "pragmas": json.loads(data["pragma_plan_json"]).get("pragmas", []),
+        "runtime_ns": _to_nano_units(data["runtime_s"]),
+        "performance": data["performance_1_per_s"],
+        "power_w": data["power_w"],
+        "energy_nj": _to_nano_units(data["energy_j"]),
+        "lut": data["lut"],
+        "efficiency_score": data["efficiency_score"],
+        "rationale": data["rationale"],
+    }
+
+
+def _normalise_forge_history(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    return {
+        "source": "forge_experiment",
+        "name": data["name"],
+        "kind": data["kind"],
+        "pragmas": json.loads(data["pragmas_json"]),
+        "runtime_ns": data["runtime_ns"],
+        "performance": data["performance"],
+        "power_w": data["power_w"],
+        "energy_nj": data["energy_nj"],
+        "lut": data["lut"],
+        "efficiency_score": data["efficiency_score"],
+    }
+
+
+def _to_nano_units(value: float | None) -> float | None:
+    return float(value) * 1_000_000_000 if value is not None else None
+
+
+def _score_for_history_sort(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("-inf")
 
 
 def _now() -> str:

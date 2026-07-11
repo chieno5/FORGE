@@ -12,6 +12,9 @@ from models import AnalysisReport, FunctionAnalysis, LoopRegion
 from testbench_generator import generate_local_testbench
 
 
+LOCAL_INCLUDE_PATTERN = re.compile(r'^\s*#include\s+"([^\"]+)"', re.MULTILINE)
+
+
 class VitisGenerationError(RuntimeError):
     """Raised when Vitis project files cannot be generated."""
 
@@ -111,7 +114,7 @@ def _write_project(
     source: Path,
     source_text: str,
     testbench: TestbenchInput | None,
-    headers: list[Path],
+    headers: list["HeaderDependency"],
     top_function: str,
     part: str,
     clock_period_ns: float,
@@ -123,8 +126,7 @@ def _write_project(
 
     generated_source = src_dir / source.name
     generated_source.write_text(source_text, encoding="utf-8")
-    for header in headers:
-        shutil.copy2(header, src_dir / header.name)
+    _copy_headers(headers, src_dir)
 
     copied_testbench: Path | None = None
     testbench_generated = False
@@ -136,8 +138,7 @@ def _write_project(
         else:
             copied_testbench.write_text(testbench.source, encoding="utf-8")
             testbench_generated = True
-        for header in headers:
-            shutil.copy2(header, tb_dir / header.name)
+        _copy_headers(headers, tb_dir)
 
     tcl_path = project_dir / "run_hls.tcl"
     tcl_path.write_text(
@@ -192,6 +193,12 @@ class TestbenchInput:
     source: str | None = None
 
 
+@dataclass(frozen=True)
+class HeaderDependency:
+    path: Path
+    relative_path: Path
+
+
 def _resolve_testbench(
     source: Path,
     source_text: str,
@@ -210,24 +217,55 @@ def _resolve_testbench(
     return TestbenchInput(filename=generated.filename, source=generated.source)
 
 
-def _resolve_local_headers(source: Path, include_dirs: list[str | Path]) -> list[Path]:
-    source_text = source.read_text(encoding="utf-8")
-    names = re.findall(r'^\s*#include\s+"([^\"]+)"', source_text, flags=re.MULTILINE)
+def _resolve_local_headers(
+    source: Path,
+    include_dirs: list[str | Path],
+) -> list[HeaderDependency]:
     search_dirs = [source.parent]
     for directory in include_dirs:
         path = Path(directory)
         if not path.is_dir():
             raise VitisGenerationError(f"Include directory does not exist: {path}")
         search_dirs.append(path)
-    headers: list[Path] = []
-    for name in names:
-        header = next((directory / name for directory in search_dirs if (directory / name).is_file()), None)
-        if header is None:
-            raise VitisGenerationError(
-                f"Quoted include was not found: {name}. Use --include-dir or place it beside the source."
-            )
-        headers.append(header)
+    headers: list[HeaderDependency] = []
+    visited: set[Path] = set()
+
+    def visit(path: Path, relative_directory: Path) -> None:
+        for name in LOCAL_INCLUDE_PATTERN.findall(path.read_text(encoding="utf-8")):
+            relative_name = Path(name)
+            if relative_name.is_absolute() or ".." in relative_name.parts:
+                raise VitisGenerationError(f"Unsupported quoted include path: {name}")
+            header = _find_local_header(name, path.parent, search_dirs)
+            if header is None:
+                raise VitisGenerationError(
+                    f"Quoted include was not found: {name}. "
+                    "Use --include-dir or place it beside the source."
+                )
+            resolved_header = header.resolve()
+            if resolved_header in visited:
+                continue
+            visited.add(resolved_header)
+            destination = relative_directory / relative_name
+            headers.append(HeaderDependency(header, destination))
+            visit(header, destination.parent)
+
+    visit(source, Path("."))
     return headers
+
+
+def _find_local_header(name: str, current_directory: Path, search_dirs: list[Path]) -> Path | None:
+    for directory in [current_directory, *search_dirs]:
+        candidate = directory / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _copy_headers(headers: list[HeaderDependency], destination_root: Path) -> None:
+    for header in headers:
+        destination = destination_root / header.relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(header.path, destination)
 
 
 def _validate_solution_safety(
@@ -238,10 +276,9 @@ def _validate_solution_safety(
     existing_interface_ports = set(
         re.findall(r"#pragma\s+HLS\s+INTERFACE\b[^\n]*\bport\s*=\s*([A-Za-z_]\w*)", source, flags=re.IGNORECASE)
     )
-    function_parameters = {
-        _parameter_name(parameter)
+    parameters_by_function = {
+        function.name: {_parameter_name(parameter) for parameter in function.parameters}
         for function in report.functions
-        for parameter in function.parameters
     }
     for directive in solution.pragmas:
         directive_name = directive.pragma.split()[2]
@@ -253,7 +290,9 @@ def _validate_solution_safety(
                 )
         if directive_name == "BIND_STORAGE":
             variable = _pragma_option(directive.pragma, "variable")
-            if variable and variable in function_parameters:
+            if variable and variable in parameters_by_function.get(
+                directive.target_function, set()
+            ):
                 raise VitisGenerationError(
                     f"BIND_STORAGE cannot target external function parameter: {variable}"
                 )

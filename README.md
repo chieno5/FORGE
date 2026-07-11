@@ -60,6 +60,10 @@ python forge.py examples/vision_pipeline.c
 Passing only a C file runs static analysis only. It does not call OpenAI or AMD
 tools. The static candidate threshold is fixed internally at `60`; the complete
 static report is still sent to OpenAI when AI recommendation is requested.
+If a returned pragma plan fails FORGE validation, FORGE sends the validation
+error back to OpenAI and retries automatically, up to three total attempts.
+FORGE recursively resolves local quoted headers such as `#include "kernel.h"`;
+use `--include-dir` only when a required header is outside the source directory.
 
 Interactive mode:
 
@@ -132,7 +136,7 @@ python forge.py INPUT [--json FILE] [--verbose]
 | `--clock NS` | `forge.toml` | Target clock period override. |
 | `--testbench FILE` | none | Copies a user-provided C/C++ testbench into each project. |
 | `--auto-testbench` | off | Generates a local smoke testbench from the top function signature. Requires `--generate`. |
-| `--include-dir DIR` | none | Directory containing quoted local headers required by the input C file. Repeat when needed. |
+| `--include-dir DIR` | none | Extra directory used to recursively resolve quoted local headers. Repeat when needed. |
 | `--vitis-hls PATH` | config/auto | Vitis HLS executable override. |
 | `--vivado PATH` | config/auto | Vivado executable override. |
 | `--amd-root PATH` | config/auto | AMD tool root override. |
@@ -151,6 +155,11 @@ AI recommendation and generation summary:
 ```text
 report/<source_name>_pragma_report.json
 ```
+
+## Test Database
+
+`forge_test.py` uses `data/forge_test.db` instead of the main database. It is
+intended for isolated experiments while preserving `data/forge.db`.
 
 Generated Vitis folders:
 
@@ -183,6 +192,8 @@ report, archives all measurements in `data/forge.db`, and creates a ZIP archive
 for the best solution. `data/` is local history and is ignored by Git.
 `--run-vitis` requires `--testbench` or `--auto-testbench`, so the final run
 includes `csim` and `cosim`.
+The baseline participates in this ranking and is kept as the final result when
+every generated candidate has a lower efficiency score.
 
 The measured design-point summary is also written as:
 
@@ -212,8 +223,9 @@ and calls the top function, but it is not a correctness oracle for the algorithm
 
 FORGE recognizes Vector add/SAXPY, matrix multiply, FIR filter, reduction/dot
 product, and 2D convolution patterns. Each classification selects matching
-history from the local SQLite database before AI recommendation. Unrecognized
-code uses a separate generic history group.
+history from the local SQLite database before AI recommendation. Imported
+history and completed FORGE experiments are combined before being sent to AI.
+Unrecognized code uses a separate generic history group.
 
 Import the validated pragma exploration history into five application tables:
 

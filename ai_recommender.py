@@ -4,12 +4,13 @@ import json
 import os
 import re
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Callable
 
 from models import AnalysisReport
 
 
 DEFAULT_MODEL = "gpt-5.4-mini"
+MAX_RECOMMENDATION_ATTEMPTS = 3
 ENERGY_EFFICIENCY_OBJECTIVE = (
     "maximize energy-LUT efficiency_score after Vitis evaluation "
     "(minimize candidate energy multiplied by LUT use relative to baseline)"
@@ -159,6 +160,8 @@ def recommend_solutions(
     model: str | None = None,
     client: Any | None = None,
     experience_context: dict[str, Any] | None = None,
+    retry_callback: Callable[[int, str], None] | None = None,
+    source_text: str | None = None,
 ) -> AIRecommendationResult:
     selected_model = model or DEFAULT_MODEL
     if client is None:
@@ -187,43 +190,62 @@ def recommend_solutions(
         design_point_count=design_point_count,
     )
 
-    try:
-        response = client.responses.create(
-            model=selected_model,
-            instructions=(
-                f"{SYSTEM_PROMPT}\nReturn exactly {design_point_count} solutions, "
-                f"ranked consecutively from 1 to {design_point_count}."
-            ),
-            input=json.dumps(request_payload, ensure_ascii=False),
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "forge_optimization_solutions",
-                    "strict": True,
-                    "schema": RESPONSE_SCHEMA,
-                }
-            },
+    correction: str | None = None
+    for attempt in range(1, MAX_RECOMMENDATION_ATTEMPTS + 1):
+        instructions = (
+            f"{SYSTEM_PROMPT}\nReturn exactly {design_point_count} solutions, "
+            f"ranked consecutively from 1 to {design_point_count}."
         )
-        raw_text = response.output_text
-    except Exception as exc:
-        raise AIRecommendationError(f"OpenAI request failed: {exc}") from exc
+        if correction:
+            instructions += (
+                "\nThe previous response failed FORGE validation with this error:\n"
+                f"{correction}\nRegenerate every solution from scratch and correct this issue."
+            )
+        try:
+            response = client.responses.create(
+                model=selected_model,
+                instructions=instructions,
+                input=json.dumps(request_payload, ensure_ascii=False),
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "forge_optimization_solutions",
+                        "strict": True,
+                        "schema": RESPONSE_SCHEMA,
+                    }
+                },
+            )
+            payload = json.loads(response.output_text)
+            solutions = parse_solution_payload(
+                payload,
+                report,
+                top_function,
+                design_point_count=design_point_count,
+                source_text=source_text,
+            )
+        except (TypeError, json.JSONDecodeError) as exc:
+            correction = "OpenAI did not return valid JSON."
+        except AIRecommendationError as exc:
+            correction = str(exc)
+        except Exception as exc:
+            raise AIRecommendationError(f"OpenAI request failed: {exc}") from exc
+        else:
+            return AIRecommendationResult(
+                model=selected_model,
+                summary=str(payload.get("summary", "")),
+                solutions=solutions,
+            )
 
-    try:
-        payload = json.loads(raw_text)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise AIRecommendationError("OpenAI did not return valid JSON.") from exc
+        if attempt < MAX_RECOMMENDATION_ATTEMPTS:
+            if retry_callback is not None:
+                retry_callback(attempt + 1, correction)
+            continue
+        raise AIRecommendationError(
+            f"AI returned invalid recommendations after {MAX_RECOMMENDATION_ATTEMPTS} attempts: "
+            f"{correction}"
+        )
 
-    solutions = parse_solution_payload(
-        payload,
-        report,
-        top_function,
-        design_point_count=design_point_count,
-    )
-    return AIRecommendationResult(
-        model=selected_model,
-        summary=str(payload.get("summary", "")),
-        solutions=solutions,
-    )
+    raise AssertionError("Recommendation retry loop unexpectedly completed.")
 
 
 def parse_solution_payload(
@@ -231,6 +253,7 @@ def parse_solution_payload(
     report: AnalysisReport,
     top_function: str,
     design_point_count: int = 3,
+    source_text: str | None = None,
 ) -> list[OptimizationSolution]:
     if not isinstance(payload, dict):
         raise AIRecommendationError("The recommendation root must be a JSON object.")
@@ -246,6 +269,7 @@ def parse_solution_payload(
         raise AIRecommendationError(f"Top function was not found: {top_function}")
     reachable_names = _reachable_function_names(all_functions, top_function)
     functions_by_name = {name: all_functions[name] for name in reachable_names}
+    existing_interface_ports = _existing_interface_ports(source_text)
 
     solutions: list[OptimizationSolution] = []
     for raw_solution in raw_solutions:
@@ -255,7 +279,10 @@ def parse_solution_payload(
         if not isinstance(raw_pragmas, list) or len(raw_pragmas) < 2:
             raise AIRecommendationError("Each solution must contain at least two pragmas.")
 
-        pragmas = [_parse_directive(item, functions_by_name) for item in raw_pragmas]
+        pragmas = [
+            _parse_directive(item, functions_by_name, existing_interface_ports)
+            for item in raw_pragmas
+        ]
         pragma_keys = {
             (item.target_function, item.target_loop_id, item.pragma) for item in pragmas
         }
@@ -324,6 +351,7 @@ def _build_request_payload(
 def _parse_directive(
     raw_item: Any,
     functions_by_name: dict[str, Any],
+    existing_interface_ports: set[str],
 ) -> PragmaDirective:
     if not isinstance(raw_item, dict):
         raise AIRecommendationError("Each pragma entry must be a JSON object.")
@@ -336,7 +364,7 @@ def _parse_directive(
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise AIRecommendationError("Pragma fields are missing or invalid.") from exc
-    _validate_directive(directive, functions_by_name)
+    _validate_directive(directive, functions_by_name, existing_interface_ports)
     return directive
 
 
@@ -364,6 +392,7 @@ def _reachable_function_names(
 def _validate_directive(
     directive: PragmaDirective,
     functions_by_name: dict[str, Any],
+    existing_interface_ports: set[str],
 ) -> None:
     target = functions_by_name.get(directive.target_function)
     if target is None:
@@ -390,6 +419,41 @@ def _validate_directive(
             raise AIRecommendationError(
                 f"PIPELINE target is not an innermost loop: {directive.target_loop_id}"
             )
+    if name == "BIND_STORAGE":
+        variable = _pragma_option(directive.pragma, "variable")
+        parameter_names = {_parameter_name(parameter) for parameter in target.parameters}
+        if variable and variable in parameter_names:
+            raise AIRecommendationError(
+                f"BIND_STORAGE cannot target external function parameter: {variable}"
+            )
+    if name == "INTERFACE":
+        port = _pragma_option(directive.pragma, "port")
+        if port and port in existing_interface_ports:
+            raise AIRecommendationError(
+                f"INTERFACE cannot override existing source pragma for port: {port}"
+            )
+
+
+def _existing_interface_ports(source_text: str | None) -> set[str]:
+    if not source_text:
+        return set()
+    return set(
+        re.findall(
+            r"#pragma\s+HLS\s+INTERFACE\b[^\n]*\bport\s*=\s*([A-Za-z_]\w*)",
+            source_text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _pragma_option(pragma: str, option: str) -> str | None:
+    match = re.search(rf"\b{re.escape(option)}\s*=\s*([A-Za-z_]\w*)", pragma)
+    return match.group(1) if match else None
+
+
+def _parameter_name(parameter: str) -> str:
+    match = re.search(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\])*$", parameter.strip())
+    return match.group(1) if match else ""
 
 
 def _normalize_pragma(pragma: str) -> str:
