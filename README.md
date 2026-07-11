@@ -46,6 +46,9 @@ Copy `forge.toml.example` to `forge.toml`. It stores the model, AMD toolchain
 path, FPGA part, target clock, timeout, output directory, and database path.
 Both `forge.toml` and `.env` are ignored by Git.
 
+Command-line arguments override `forge.toml`. If `amd_root` is empty or absent,
+FORGE also checks the latest installation under `C:\AMDDesignTools`.
+
 ## Quick Start
 
 Static analysis summary:
@@ -54,10 +57,24 @@ Static analysis summary:
 python forge.py examples/vision_pipeline.c
 ```
 
+Passing only a C file runs static analysis only. It does not call OpenAI or AMD
+tools. The static candidate threshold is fixed internally at `60`; the complete
+static report is still sent to OpenAI when AI recommendation is requested.
+
 Interactive mode:
 
 ```powershell
 python forge.py
+```
+
+Inside interactive mode, enter the same file-and-option command without
+`python forge.py`, or use the optional `run` prefix:
+
+```text
+forge> help
+forge> examples/vision_pipeline.c
+forge> run examples/vision_pipeline.c --generate --auto-testbench
+forge> exit
 ```
 
 Write the static JSON report:
@@ -101,27 +118,25 @@ python forge.py INPUT [--json FILE] [--verbose]
 | Argument | Default | Description |
 | --- | --- | --- |
 | `INPUT` | required | C source file to analyze. |
-| `--json FILE` | none | Writes static analysis JSON under `report/`; only the filename is used. |
+| `--json FILE` | none | Writes static analysis JSON under `report/`; only the filename is used. AI and generation flows also write a static report automatically. |
 | `--verbose` | off | Prints detailed features, reasoning, and loop-level data. |
 | `--ai` | off | Requests energy-LUT design points from OpenAI. |
 | `--generate` | off | Runs AI recommendation and generates baseline plus design-point folders. |
 | `--design-points N` | `3` | Number of AI design points. The baseline is added separately. |
 | `--run-vitis` | off | Runs Vitis HLS and Vivado, ranks results, and packages the best design point. Requires `--generate`. |
-| `--tool-timeout SECONDS` | `600` | Maximum time for each Vitis or Vivado command. A timed-out design point is recorded as failed and the remaining candidates continue. |
+| `--tool-timeout SECONDS` | `forge.toml` (`600`) | Maximum time for each Vitis or Vivado command. A timed-out design point is recorded as failed and the remaining candidates continue. |
 | `--model MODEL` | `forge.toml` | OpenAI model override. |
 | `--top FUNCTION` | call-graph entry | Vitis HLS top function override. |
 | `--output-root DIR` | `forge.toml` | Generated-project root override. |
 | `--part PART` | `forge.toml` | FPGA part override. |
 | `--clock NS` | `forge.toml` | Target clock period override. |
 | `--testbench FILE` | none | Copies a user-provided C/C++ testbench into each project. |
-| `--auto-testbench` | off | Generates a local smoke testbench from the top function signature. |
+| `--auto-testbench` | off | Generates a local smoke testbench from the top function signature. Requires `--generate`. |
 | `--include-dir DIR` | none | Directory containing quoted local headers required by the input C file. Repeat when needed. |
 | `--vitis-hls PATH` | config/auto | Vitis HLS executable override. |
 | `--vivado PATH` | config/auto | Vivado executable override. |
 | `--amd-root PATH` | config/auto | AMD tool root override. |
 | `--database FILE` | `forge.toml` | Local SQLite database override. |
-
-Command-line arguments override `forge.toml`.
 
 ## Output
 
@@ -168,6 +183,14 @@ report, archives all measurements in `data/forge.db`, and creates a ZIP archive
 for the best solution. `data/` is local history and is ignored by Git.
 `--run-vitis` requires `--testbench` or `--auto-testbench`, so the final run
 includes `csim` and `cosim`.
+
+The measured design-point summary is also written as:
+
+```text
+report/<source_name>_experiment_results.json
+report/<source_name>_experiment_results.csv
+report/<source_name>_experiment_results.md
+```
 
 FORGE prints concise stage updates for C simulation, C synthesis, co-simulation,
 and Vivado power estimation. Detailed tool output remains in each project's log
