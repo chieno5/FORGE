@@ -3,4 +3,7 @@ __pycache__/
 *_report.json
 report/
 generated/
+data/
 .env
+forge.toml
+tests/

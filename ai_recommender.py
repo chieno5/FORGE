@@ -10,7 +10,10 @@ from models import AnalysisReport
 
 
 DEFAULT_MODEL = "gpt-5.4-mini"
-ENERGY_EFFICIENCY_OBJECTIVE = "maximize performance per watt per LUT after Vitis evaluation"
+ENERGY_EFFICIENCY_OBJECTIVE = (
+    "maximize energy-LUT efficiency_score after Vitis evaluation "
+    "(minimize candidate energy multiplied by LUT use relative to baseline)"
+)
 SUPPORTED_DIRECTIVES = {
     "ALLOCATION",
     "ARRAY_PARTITION",
@@ -130,10 +133,10 @@ RESPONSE_SCHEMA: dict[str, Any] = {
 
 
 SYSTEM_PROMPT = """You are a Vitis HLS optimisation expert working inside FORGE.
-Create exactly three distinct whole-design design points for energy-efficiency exploration.
+Create the requested number of distinct whole-design design points for energy-LUT exploration.
 Every solution becomes a complete Vitis project and should contain 2 to 6 coordinated pragmas
 across the top function and its analyzed helper functions when the source structure supports it.
-The later selection metric will be performance per watt per LUT after Vitis reports are available.
+The later selection metric is efficiency_score based on energy and LUT after Vitis reports are available.
 Balance latency, initiation interval, resource growth and expected switching activity. Do not optimize
 only for raw performance or only for low power.
 Use only valid '#pragma HLS ...' syntax and loop IDs present in the input JSON.
@@ -141,6 +144,9 @@ Prefer PIPELINE, UNROLL, DATAFLOW, ARRAY_PARTITION, ARRAY_RESHAPE, ALLOCATION,
 BIND_OP, BIND_STORAGE, INLINE, DEPENDENCE, INTERFACE, LATENCY, STREAM or STABLE.
 Write directive names in uppercase. Use an empty target_loop_id for function-level pragmas.
 Do not invent functions, loops or array names. Do not repeat or contradict pragmas in one solution.
+Never apply PIPELINE to a function or to a loop that contains deeper nested loops. PIPELINE is
+only allowed on an innermost analyzed loop. Do not add INTERFACE pragmas for ports that already
+have source-level interface directives, and do not bind external function arguments as local storage.
 Make the three strategies meaningfully different and return only the requested structured data."""
 
 
@@ -149,11 +155,12 @@ def recommend_solutions(
     top_function: str,
     part: str,
     clock_period_ns: float,
+    design_point_count: int = 3,
     model: str | None = None,
     client: Any | None = None,
     experience_context: dict[str, Any] | None = None,
 ) -> AIRecommendationResult:
-    selected_model = model or os.getenv("FORGE_OPENAI_MODEL", DEFAULT_MODEL)
+    selected_model = model or DEFAULT_MODEL
     if client is None:
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
@@ -168,18 +175,25 @@ def recommend_solutions(
             ) from exc
         client = OpenAI(api_key=api_key)
 
+    if design_point_count < 1:
+        raise AIRecommendationError("design_point_count must be at least 1.")
+
     request_payload = _build_request_payload(
         report=report,
         top_function=top_function,
         part=part,
         clock_period_ns=clock_period_ns,
         experience_context=experience_context,
+        design_point_count=design_point_count,
     )
 
     try:
         response = client.responses.create(
             model=selected_model,
-            instructions=SYSTEM_PROMPT,
+            instructions=(
+                f"{SYSTEM_PROMPT}\nReturn exactly {design_point_count} solutions, "
+                f"ranked consecutively from 1 to {design_point_count}."
+            ),
             input=json.dumps(request_payload, ensure_ascii=False),
             text={
                 "format": {
@@ -199,7 +213,12 @@ def recommend_solutions(
     except (TypeError, json.JSONDecodeError) as exc:
         raise AIRecommendationError("OpenAI did not return valid JSON.") from exc
 
-    solutions = parse_solution_payload(payload, report, top_function)
+    solutions = parse_solution_payload(
+        payload,
+        report,
+        top_function,
+        design_point_count=design_point_count,
+    )
     return AIRecommendationResult(
         model=selected_model,
         summary=str(payload.get("summary", "")),
@@ -211,13 +230,16 @@ def parse_solution_payload(
     payload: dict[str, Any],
     report: AnalysisReport,
     top_function: str,
+    design_point_count: int = 3,
 ) -> list[OptimizationSolution]:
     if not isinstance(payload, dict):
         raise AIRecommendationError("The recommendation root must be a JSON object.")
 
     raw_solutions = payload.get("solutions")
-    if not isinstance(raw_solutions, list) or len(raw_solutions) != 3:
-        raise AIRecommendationError("AI must return exactly three complete solutions.")
+    if not isinstance(raw_solutions, list) or len(raw_solutions) != design_point_count:
+        raise AIRecommendationError(
+            f"AI must return exactly {design_point_count} complete solutions."
+        )
 
     all_functions = {function.name: function for function in report.functions}
     if top_function not in all_functions:
@@ -257,8 +279,11 @@ def parse_solution_payload(
         solutions.append(solution)
 
     solutions.sort(key=lambda item: (item.rank, -item.confidence))
-    if [item.rank for item in solutions] != [1, 2, 3]:
-        raise AIRecommendationError("The three solution ranks must be 1, 2 and 3.")
+    expected_ranks = list(range(1, design_point_count + 1))
+    if [item.rank for item in solutions] != expected_ranks:
+        raise AIRecommendationError(
+            f"Solution ranks must be {expected_ranks}."
+        )
 
     solution_keys = {
         tuple(
@@ -269,7 +294,7 @@ def parse_solution_payload(
         )
         for solution in solutions
     }
-    if len(solution_keys) != 3:
+    if len(solution_keys) != design_point_count:
         raise AIRecommendationError("AI returned repeated solution content.")
     return solutions
 
@@ -280,6 +305,7 @@ def _build_request_payload(
     part: str,
     clock_period_ns: float,
     experience_context: dict[str, Any] | None,
+    design_point_count: int,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "project": "FORGE: FPGA Optimization and Reconfiguration Generation Engine",
@@ -287,6 +313,7 @@ def _build_request_payload(
         "optimization_objective": ENERGY_EFFICIENCY_OBJECTIVE,
         "target_part": part,
         "clock_period_ns": clock_period_ns,
+        "design_point_count": design_point_count,
         "static_analysis": report.to_dict(),
     }
     if experience_context:
@@ -355,6 +382,14 @@ def _validate_directive(
     name = parts[2] if len(parts) >= 3 else ""
     if name not in SUPPORTED_DIRECTIVES:
         raise AIRecommendationError(f"Unsupported HLS directive: {name}")
+    if name == "PIPELINE":
+        if not directive.target_loop_id:
+            raise AIRecommendationError("PIPELINE must target an innermost loop, not a function.")
+        loop = next(region for region in target.loop_regions if region.id == directive.target_loop_id)
+        if any(region.depth > loop.depth for region in target.loop_regions):
+            raise AIRecommendationError(
+                f"PIPELINE target is not an innermost loop: {directive.target_loop_id}"
+            )
 
 
 def _normalize_pragma(pragma: str) -> str:

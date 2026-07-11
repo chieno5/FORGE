@@ -1,0 +1,14 @@
+[ai]
+model = "gpt-5.4-mini"
+
+[toolchain]
+amd_root = 'C:\AMDDesignTools\2025.2'
+part = "xc7z020clg400-1"
+clock_ns = 10.0
+timeout_seconds = 600
+
+[output]
+root = "generated"
+
+[database]
+path = "data/forge.db"

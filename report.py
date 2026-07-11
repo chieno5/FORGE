@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import csv
 from pathlib import Path
 from typing import Any
 
@@ -8,7 +9,7 @@ from models import AnalysisReport, FunctionAnalysis, LoopRegion
 
 
 def print_human_report(report: AnalysisReport, verbose: bool = False) -> None:
-    print("FORGE Analysis Summary")
+    print("[FORGE] Static analysis report")
     print("=" * 72)
     print(f"File: {report.file}")
     print(f"Candidate threshold: {report.threshold}")
@@ -78,6 +79,53 @@ def write_data_report(data: dict[str, Any], output_path: str | Path) -> None:
     )
 
 
+def write_experiment_reports(
+    results: list[dict[str, Any]],
+    output_dir: str | Path,
+    stem: str,
+) -> dict[str, str]:
+    """Write portable JSON, CSV and Markdown summaries for completed experiments."""
+
+    directory = Path(output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    json_path = directory / f"{stem}_experiment_results.json"
+    csv_path = directory / f"{stem}_experiment_results.csv"
+    markdown_path = directory / f"{stem}_experiment_results.md"
+    write_data_report({"experiments": results}, json_path)
+
+    fields = [
+        "name", "kind", "status", "latency_cycles", "initiation_interval",
+        "clock_period_ns", "runtime_ns", "performance", "power_w", "energy_nj",
+        "lut", "ff", "bram", "dsp", "performance_norm", "power_norm",
+        "energy_norm", "lut_norm", "efficiency_score", "package_path", "error",
+    ]
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows({key: item.get(key) for key in fields} for item in results)
+
+    lines = [
+        "# FORGE Experiment Results",
+        "",
+        "| Design point | Status | Runtime (ns) | Power (W) | Energy (nJ) | LUT | Efficiency score |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for item in results:
+        lines.append(
+            "| {name} | {status} | {runtime} | {power} | {energy} | {lut} | {score} |".format(
+                name=item.get("name", ""),
+                status=item.get("status", ""),
+                runtime=_display_number(item.get("runtime_ns")),
+                power=_display_number(item.get("power_w")),
+                energy=_display_number(item.get("energy_nj")),
+                lut=_display_number(item.get("lut")),
+                score=_display_number(item.get("efficiency_score")),
+            )
+        )
+    markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return {"json": str(json_path), "csv": str(csv_path), "markdown": str(markdown_path)}
+
+
 def _print_function(function: FunctionAnalysis) -> None:
     print(f"Function: {function.name}")
     print(f"Score: {function.score} / 100")
@@ -132,3 +180,9 @@ def _print_features(features: dict[str, Any], indent: str = "  ") -> None:
 
 def _yes_no(value: bool) -> str:
     return "yes" if value else "no"
+
+
+def _display_number(value: Any) -> str:
+    if isinstance(value, float):
+        return f"{value:.6g}"
+    return "-" if value is None else str(value)

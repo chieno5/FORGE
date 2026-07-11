@@ -42,6 +42,7 @@ def generate_vitis_projects(
     clock_period_ns: float = 10.0,
     testbench_path: str | Path | None = None,
     auto_testbench: bool = False,
+    include_dirs: list[str | Path] | None = None,
 ) -> list[GeneratedProject]:
     source = Path(source_path)
     if not source.exists():
@@ -52,13 +53,14 @@ def generate_vitis_projects(
         raise VitisGenerationError(f"Invalid FPGA part format: {part}")
     if clock_period_ns <= 0:
         raise VitisGenerationError("Clock period must be greater than 0.")
-    if len(solutions) != 3:
-        raise VitisGenerationError("Exactly three optimisation solutions are required.")
+    if not solutions:
+        raise VitisGenerationError("At least one optimisation solution is required.")
     if testbench_path and auto_testbench:
         raise VitisGenerationError("Use either --testbench or --auto-testbench, not both.")
 
     top_analysis = _find_function(report, top_function)
     original_source = source.read_text(encoding="utf-8")
+    headers = _resolve_local_headers(source, include_dirs or [])
     testbench = _resolve_testbench(
         source=source,
         source_text=original_source,
@@ -75,6 +77,7 @@ def generate_vitis_projects(
             source=source,
             source_text=_prepare_vitis_source(original_source, report, top_function),
             testbench=testbench,
+            headers=headers,
             top_function=top_function,
             part=part,
             clock_period_ns=clock_period_ns,
@@ -83,14 +86,16 @@ def generate_vitis_projects(
     )
 
     for solution in solutions:
+        _validate_solution_safety(original_source, report, solution)
         transformed = _insert_pragmas(original_source, report, solution.pragmas)
         project_name = f"solution_{solution.rank:02d}_{_slug(solution.name)}"
         generated.append(
             _write_project(
                 project_dir=project_root / project_name,
                 source=source,
-                source_text=_prepare_vitis_source(transformed, report, top_function),
-                testbench=testbench,
+            source_text=_prepare_vitis_source(transformed, report, top_function),
+            testbench=testbench,
+            headers=headers,
                 top_function=top_function,
                 part=part,
                 clock_period_ns=clock_period_ns,
@@ -106,6 +111,7 @@ def _write_project(
     source: Path,
     source_text: str,
     testbench: TestbenchInput | None,
+    headers: list[Path],
     top_function: str,
     part: str,
     clock_period_ns: float,
@@ -117,6 +123,8 @@ def _write_project(
 
     generated_source = src_dir / source.name
     generated_source.write_text(source_text, encoding="utf-8")
+    for header in headers:
+        shutil.copy2(header, src_dir / header.name)
 
     copied_testbench: Path | None = None
     testbench_generated = False
@@ -128,6 +136,8 @@ def _write_project(
         else:
             copied_testbench.write_text(testbench.source, encoding="utf-8")
             testbench_generated = True
+        for header in headers:
+            shutil.copy2(header, tb_dir / header.name)
 
     tcl_path = project_dir / "run_hls.tcl"
     tcl_path.write_text(
@@ -149,7 +159,7 @@ def _write_project(
     metadata = {
         "project": "FORGE",
         "kind": "solution" if solution else "baseline",
-        "optimization_objective": "performance_per_watt_per_lut",
+        "optimization_objective": "energy_lut_efficiency",
         "top_function": top_function,
         "part": part,
         "clock_period_ns": clock_period_ns,
@@ -198,6 +208,65 @@ def _resolve_testbench(
         return None
     generated = generate_local_testbench(source_text, source.stem, top_analysis)
     return TestbenchInput(filename=generated.filename, source=generated.source)
+
+
+def _resolve_local_headers(source: Path, include_dirs: list[str | Path]) -> list[Path]:
+    source_text = source.read_text(encoding="utf-8")
+    names = re.findall(r'^\s*#include\s+"([^\"]+)"', source_text, flags=re.MULTILINE)
+    search_dirs = [source.parent]
+    for directory in include_dirs:
+        path = Path(directory)
+        if not path.is_dir():
+            raise VitisGenerationError(f"Include directory does not exist: {path}")
+        search_dirs.append(path)
+    headers: list[Path] = []
+    for name in names:
+        header = next((directory / name for directory in search_dirs if (directory / name).is_file()), None)
+        if header is None:
+            raise VitisGenerationError(
+                f"Quoted include was not found: {name}. Use --include-dir or place it beside the source."
+            )
+        headers.append(header)
+    return headers
+
+
+def _validate_solution_safety(
+    source: str,
+    report: AnalysisReport,
+    solution: OptimizationSolution,
+) -> None:
+    existing_interface_ports = set(
+        re.findall(r"#pragma\s+HLS\s+INTERFACE\b[^\n]*\bport\s*=\s*([A-Za-z_]\w*)", source, flags=re.IGNORECASE)
+    )
+    function_parameters = {
+        _parameter_name(parameter)
+        for function in report.functions
+        for parameter in function.parameters
+    }
+    for directive in solution.pragmas:
+        directive_name = directive.pragma.split()[2]
+        if directive_name == "INTERFACE":
+            port = _pragma_option(directive.pragma, "port")
+            if port and port in existing_interface_ports:
+                raise VitisGenerationError(
+                    f"AI attempted to override an existing INTERFACE pragma for port: {port}"
+                )
+        if directive_name == "BIND_STORAGE":
+            variable = _pragma_option(directive.pragma, "variable")
+            if variable and variable in function_parameters:
+                raise VitisGenerationError(
+                    f"BIND_STORAGE cannot target external function parameter: {variable}"
+                )
+
+
+def _pragma_option(pragma: str, option: str) -> str | None:
+    match = re.search(rf"\b{re.escape(option)}\s*=\s*([A-Za-z_]\w*)", pragma)
+    return match.group(1) if match else None
+
+
+def _parameter_name(parameter: str) -> str:
+    match = re.search(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\])*$", parameter.strip())
+    return match.group(1) if match else ""
 
 
 def _prepare_vitis_source(

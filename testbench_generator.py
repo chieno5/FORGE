@@ -42,8 +42,9 @@ def generate_local_testbench(
     lines: list[str] = [
         "/* Auto-generated smoke testbench for Vitis HLS. */",
         "#include <stdint.h>",
-        "",
     ]
+    lines.extend(_extract_local_includes(source_text))
+    lines.append("")
     if typedefs:
         lines.extend(typedefs)
         lines.append("")
@@ -169,6 +170,10 @@ def _parse_parameter(parameter: str) -> ParameterSpec:
 
 def _extract_typedefs(source_text: str) -> list[str]:
     return re.findall(r"^\s*typedef\b[^;]*;", source_text, flags=re.MULTILINE)
+
+
+def _extract_local_includes(source_text: str) -> list[str]:
+    return re.findall(r"^\s*(#include\s+\"[^\"]+\")", source_text, flags=re.MULTILINE)
 
 
 def _dimension_or_default(dimension: str) -> str:
