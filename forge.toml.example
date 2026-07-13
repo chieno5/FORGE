@@ -11,4 +11,4 @@ timeout_seconds = 600
 root = "generated"
 
 [database]
-path = "data/forge.db"
+path = "data/forge_test.db"

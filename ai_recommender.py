@@ -15,28 +15,13 @@ ENERGY_EFFICIENCY_OBJECTIVE = (
     "maximize energy-LUT efficiency_score after Vitis evaluation "
     "(minimize candidate energy multiplied by LUT use relative to baseline)"
 )
-SUPPORTED_DIRECTIVES = {
+# This subset is intentionally smaller than the full Vitis HLS pragma language.
+# It keeps unattended exploration within directives we can safely validate.
+AUTO_GENERATION_DIRECTIVES = {
     "ALLOCATION",
     "ARRAY_PARTITION",
-    "ARRAY_RESHAPE",
-    "BIND_OP",
-    "BIND_STORAGE",
-    "DATAFLOW",
-    "DEPENDENCE",
-    "FUNCTION_INSTANTIATE",
     "INLINE",
-    "INTERFACE",
-    "LATENCY",
-    "LOOP_FLATTEN",
-    "LOOP_MERGE",
-    "LOOP_TRIPCOUNT",
-    "OCCURRENCE",
     "PIPELINE",
-    "PROTOCOL",
-    "RESET",
-    "RESOURCE",
-    "STABLE",
-    "STREAM",
     "UNROLL",
 }
 
@@ -77,13 +62,17 @@ class AIRecommendationResult:
     model: str
     summary: str
     solutions: list[OptimizationSolution]
+    fallback_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "model": self.model,
             "summary": self.summary,
             "solutions": [item.to_dict() for item in self.solutions],
         }
+        if self.fallback_reason:
+            result["fallback_reason"] = self.fallback_reason
+        return result
 
 
 PRAGMA_SCHEMA: dict[str, Any] = {
@@ -135,19 +124,29 @@ RESPONSE_SCHEMA: dict[str, Any] = {
 
 SYSTEM_PROMPT = """You are a Vitis HLS optimisation expert working inside FORGE.
 Create the requested number of distinct whole-design design points for energy-LUT exploration.
-Every solution becomes a complete Vitis project and should contain 2 to 6 coordinated pragmas
+Every solution becomes a complete Vitis project and should contain 2 to 4 coordinated pragmas
 across the top function and its analyzed helper functions when the source structure supports it.
 The later selection metric is efficiency_score based on energy and LUT after Vitis reports are available.
 Balance latency, initiation interval, resource growth and expected switching activity. Do not optimize
 only for raw performance or only for low power.
 Use only valid '#pragma HLS ...' syntax and loop IDs present in the input JSON.
-Prefer PIPELINE, UNROLL, DATAFLOW, ARRAY_PARTITION, ARRAY_RESHAPE, ALLOCATION,
-BIND_OP, BIND_STORAGE, INLINE, DEPENDENCE, INTERFACE, LATENCY, STREAM or STABLE.
+Only use these automatic-exploration directives: PIPELINE, UNROLL, ARRAY_PARTITION,
+ALLOCATION and INLINE. Never use BIND_STORAGE, INTERFACE, DATAFLOW, ARRAY_RESHAPE,
+BIND_OP, RESOURCE, DEPENDENCE or any directive not in that list.
 Write directive names in uppercase. Use an empty target_loop_id for function-level pragmas.
 Do not invent functions, loops or array names. Do not repeat or contradict pragmas in one solution.
+Set name to a short descriptive snake_case label, such as balanced_mac_pipeline. Do not include
+dp01, an ordinal, or the word candidate in name; FORGE adds the run-local dpNN prefix itself.
 Never apply PIPELINE to a function or to a loop that contains deeper nested loops. PIPELINE is
-only allowed on an innermost analyzed loop. Do not add INTERFACE pragmas for ports that already
-have source-level interface directives, and do not bind external function arguments as local storage.
+only allowed on an innermost analyzed loop. Do not apply ARRAY_PARTITION complete to an external
+function argument. For ARRAY_PARTITION, use a supplied array parameter, cyclic/block style,
+factor 2, 4 or 8, and dim=1.
+The input contains pipeline_allowed_loop_ids and unroll_allowed_loop_ids. Use PIPELINE or UNROLL
+only on the corresponding exact loop IDs. Do not apply either directive to a loop marked with a
+loop-carried dependency; recommend a refactor-oriented function-level alternative instead.
+The history may include earlier plans for the same source. Prefer unexplored design points, but do
+not treat a prior plan as forbidden: repeat it only when it is a useful verification or benchmark
+and explain that choice in the strategy and risk fields.
 Make the three strategies meaningfully different and return only the requested structured data."""
 
 
@@ -188,6 +187,7 @@ def recommend_solutions(
         clock_period_ns=clock_period_ns,
         experience_context=experience_context,
         design_point_count=design_point_count,
+        source_text=source_text,
     )
 
     correction: str | None = None
@@ -199,7 +199,8 @@ def recommend_solutions(
         if correction:
             instructions += (
                 "\nThe previous response failed FORGE validation with this error:\n"
-                f"{correction}\nRegenerate every solution from scratch and correct this issue."
+                f"{correction}\nRegenerate every solution from scratch and correct this issue. "
+                "Use only the supplied pipeline_allowed_loop_ids and unroll_allowed_loop_ids."
             )
         try:
             response = client.responses.create(
@@ -228,7 +229,7 @@ def recommend_solutions(
         except AIRecommendationError as exc:
             correction = str(exc)
         except Exception as exc:
-            raise AIRecommendationError(f"OpenAI request failed: {exc}") from exc
+            correction = f"OpenAI request failed: {exc}"
         else:
             return AIRecommendationResult(
                 model=selected_model,
@@ -240,9 +241,12 @@ def recommend_solutions(
             if retry_callback is not None:
                 retry_callback(attempt + 1, correction)
             continue
-        raise AIRecommendationError(
-            f"AI returned invalid recommendations after {MAX_RECOMMENDATION_ATTEMPTS} attempts: "
-            f"{correction}"
+        return _fallback_recommendations(
+            report,
+            top_function,
+            design_point_count,
+            selected_model,
+            correction or "OpenAI did not return a usable recommendation.",
         )
 
     raise AssertionError("Recommendation retry loop unexpectedly completed.")
@@ -292,7 +296,11 @@ def parse_solution_payload(
         try:
             solution = OptimizationSolution(
                 rank=int(raw_solution["rank"]),
-                name=str(raw_solution["name"]).strip(),
+                name=_run_scoped_solution_name(
+                    str(raw_solution["name"]).strip(),
+                    int(raw_solution["rank"]),
+                    str(raw_solution["strategy"]).strip(),
+                ),
                 strategy=str(raw_solution["strategy"]).strip(),
                 expected_effect=str(raw_solution["expected_effect"]).strip(),
                 risk=str(raw_solution["risk"]).strip(),
@@ -333,6 +341,7 @@ def _build_request_payload(
     clock_period_ns: float,
     experience_context: dict[str, Any] | None,
     design_point_count: int,
+    source_text: str | None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "project": "FORGE: FPGA Optimization and Reconfiguration Generation Engine",
@@ -341,7 +350,16 @@ def _build_request_payload(
         "target_part": part,
         "clock_period_ns": clock_period_ns,
         "design_point_count": design_point_count,
+        "source_code": source_text or "",
         "static_analysis": report.to_dict(),
+        "pragma_constraints": {
+            "automatic_directives": sorted(AUTO_GENERATION_DIRECTIVES),
+            "pipeline_allowed_loop_ids": _pipeline_allowed_loop_ids(report),
+            "unroll_allowed_loop_ids": _unroll_allowed_loop_ids(report),
+            "dependency_restricted_loop_ids": _dependency_restricted_loop_ids(report),
+            "array_partition_allowed_variables": _array_parameter_names(report),
+            "external_parameter_rules": ["ARRAY_PARTITION complete is not allowed."],
+        },
     }
     if experience_context:
         payload["experience_context"] = experience_context
@@ -409,22 +427,40 @@ def _validate_directive(
         raise AIRecommendationError(f"Invalid pragma format: {directive.pragma}")
     parts = directive.pragma.split()
     name = parts[2] if len(parts) >= 3 else ""
-    if name not in SUPPORTED_DIRECTIVES:
-        raise AIRecommendationError(f"Unsupported HLS directive: {name}")
+    if name not in AUTO_GENERATION_DIRECTIVES:
+        raise AIRecommendationError(
+            f"Directive is not enabled for automatic generation: {name}"
+        )
     if name == "PIPELINE":
         if not directive.target_loop_id:
             raise AIRecommendationError("PIPELINE must target an innermost loop, not a function.")
         loop = next(region for region in target.loop_regions if region.id == directive.target_loop_id)
-        if any(region.depth > loop.depth for region in target.loop_regions):
+        if not _is_innermost_loop(target.loop_regions, loop.id):
             raise AIRecommendationError(
                 f"PIPELINE target is not an innermost loop: {directive.target_loop_id}"
             )
-    if name == "BIND_STORAGE":
+        if not loop.features.get("pipeline_eligible", True):
+            raise AIRecommendationError(
+                f"PIPELINE target has a loop-carried dependency: {directive.target_loop_id}"
+            )
+    if name == "UNROLL":
+        if not directive.target_loop_id:
+            raise AIRecommendationError("UNROLL must target an analyzed loop, not a function.")
+        loop = next(region for region in target.loop_regions if region.id == directive.target_loop_id)
+        if not loop.features.get("unroll_eligible", True):
+            raise AIRecommendationError(
+                f"UNROLL target has a loop-carried dependency: {directive.target_loop_id}"
+            )
+    if name == "ARRAY_PARTITION":
         variable = _pragma_option(directive.pragma, "variable")
         parameter_names = {_parameter_name(parameter) for parameter in target.parameters}
-        if variable and variable in parameter_names:
+        if (
+            variable
+            and variable in parameter_names
+            and _is_complete_array_partition(directive.pragma)
+        ):
             raise AIRecommendationError(
-                f"BIND_STORAGE cannot target external function parameter: {variable}"
+                f"ARRAY_PARTITION complete cannot target external function parameter: {variable}"
             )
     if name == "INTERFACE":
         port = _pragma_option(directive.pragma, "port")
@@ -446,9 +482,72 @@ def _existing_interface_ports(source_text: str | None) -> set[str]:
     )
 
 
+def _pipeline_allowed_loop_ids(report: AnalysisReport) -> dict[str, list[str]]:
+    return {
+        function.name: [
+            loop.id
+            for loop in function.loop_regions
+            if _is_innermost_loop(function.loop_regions, loop.id)
+            and loop.features.get("pipeline_eligible", True)
+        ]
+        for function in report.functions
+    }
+
+
+def _unroll_allowed_loop_ids(report: AnalysisReport) -> dict[str, list[str]]:
+    return {
+        function.name: [
+            loop.id
+            for loop in function.loop_regions
+            if loop.features.get("unroll_eligible", True)
+        ]
+        for function in report.functions
+    }
+
+
+def _dependency_restricted_loop_ids(report: AnalysisReport) -> dict[str, list[str]]:
+    return {
+        function.name: [
+            loop.id
+            for loop in function.loop_regions
+            if loop.features.get("has_loop_carried_dependency", False)
+        ]
+        for function in report.functions
+    }
+
+
+def _array_parameter_names(report: AnalysisReport) -> dict[str, list[str]]:
+    return {
+        function.name: [
+            name
+            for parameter in function.parameters
+            if (name := _parameter_name(parameter))
+            and ("[" in parameter or "*" in parameter)
+        ]
+        for function in report.functions
+    }
+
+
+def _is_innermost_loop(loop_regions: list[Any], loop_id: str) -> bool:
+    for index, loop in enumerate(loop_regions):
+        if loop.id != loop_id:
+            continue
+        for later_loop in loop_regions[index + 1 :]:
+            if later_loop.depth <= loop.depth:
+                return True
+            if later_loop.depth > loop.depth:
+                return False
+        return True
+    return False
+
+
 def _pragma_option(pragma: str, option: str) -> str | None:
     match = re.search(rf"\b{re.escape(option)}\s*=\s*([A-Za-z_]\w*)", pragma)
     return match.group(1) if match else None
+
+
+def _is_complete_array_partition(pragma: str) -> bool:
+    return re.search(r"\bcomplete\b", pragma, flags=re.IGNORECASE) is not None
 
 
 def _parameter_name(parameter: str) -> str:
@@ -459,10 +558,142 @@ def _parameter_name(parameter: str) -> str:
 def _normalize_pragma(pragma: str) -> str:
     value = pragma.strip()
     match = re.fullmatch(
-        r"#pragma\s+hls\s+([A-Za-z_][A-Za-z0-9_]*)(.*)",
+        r"(?:(?:#pragma\s+)?hls\s+)?([A-Za-z_][A-Za-z0-9_]*)(.*)",
         value,
         flags=re.IGNORECASE,
     )
     if match is None:
         return value
     return f"#pragma HLS {match.group(1).upper()}{match.group(2)}"
+
+
+def _fallback_recommendations(
+    report: AnalysisReport,
+    top_function: str,
+    design_point_count: int,
+    model: str,
+    reason: str,
+) -> AIRecommendationResult:
+    """Create conservative design points when the remote response stays unusable."""
+
+    functions = {function.name: function for function in report.functions}
+    reachable_names = sorted(_reachable_function_names(functions, top_function))
+    reachable = {name: functions[name] for name in reachable_names}
+    pipeline_loops = [
+        loop_id
+        for function_name, loop_ids in _pipeline_allowed_loop_ids(report).items()
+        if function_name in reachable
+        for loop_id in loop_ids
+    ]
+    unroll_loops = [
+        loop_id
+        for function_name, loop_ids in _unroll_allowed_loop_ids(report).items()
+        if function_name in reachable
+        for loop_id in loop_ids
+    ]
+    arrays = [
+        (function_name, array_name)
+        for function_name in reachable_names
+        for array_name in _array_parameter_names(report).get(function_name, [])
+    ]
+    solutions: list[OptimizationSolution] = []
+
+    for rank in range(1, design_point_count + 1):
+        variation = rank - 1
+        pragmas: list[PragmaDirective] = []
+        use_unroll = bool(unroll_loops) and (not pipeline_loops or variation % 3 == 2)
+        if use_unroll:
+            target_loop = unroll_loops[variation % len(unroll_loops)]
+            pragmas.append(
+                PragmaDirective(
+                    _loop_function_name(target_loop),
+                    target_loop,
+                    f"#pragma HLS UNROLL factor={2 ** (1 + (variation // 3))}",
+                    "Local fallback uses a small, bounded unroll factor.",
+                )
+            )
+            strategy = "conservative_loop_unroll"
+        elif pipeline_loops:
+            target_loop = pipeline_loops[variation % len(pipeline_loops)]
+            pragmas.append(
+                PragmaDirective(
+                    _loop_function_name(target_loop),
+                    target_loop,
+                    f"#pragma HLS PIPELINE II={1 + variation}",
+                    "Local fallback pipelines a statically eligible innermost loop.",
+                )
+            )
+            strategy = "conservative_loop_pipeline"
+        else:
+            strategy = "conservative_memory_exploration"
+
+        if arrays:
+            function_name, array_name = arrays[variation % len(arrays)]
+            pragmas.append(
+                PragmaDirective(
+                    function_name,
+                    "",
+                    "#pragma HLS ARRAY_PARTITION "
+                    f"variable={array_name} cyclic factor={2 ** (1 + (variation % 3))} dim=1",
+                    "Local fallback uses a bounded cyclic partition on an array parameter.",
+                )
+            )
+        else:
+            pragmas.append(
+                PragmaDirective(
+                    top_function,
+                    "",
+                    "#pragma HLS ALLOCATION "
+                    f"operation instances=mul limit={1 + variation}",
+                    "Local fallback bounds multiplier sharing when no array parameter is available.",
+                )
+            )
+
+        if len(pragmas) < 2:
+            pragmas.append(
+                PragmaDirective(
+                    top_function,
+                    "",
+                    "#pragma HLS INLINE off",
+                    "Local fallback keeps hierarchy explicit for a resource-oriented alternative.",
+                )
+            )
+        solutions.append(
+            OptimizationSolution(
+                rank=rank,
+                name=f"dp{rank:02d}_local_safe_{strategy}_{rank}",
+                strategy=strategy,
+                expected_effect="Produces a conservative, executable HLS exploration point.",
+                risk="The result is rule-based because the AI response could not be validated.",
+                confidence=0.35,
+                pragmas=pragmas,
+            )
+        )
+
+    return AIRecommendationResult(
+        model=model,
+        summary=(
+            "OpenAI recommendations remained invalid after retries; FORGE generated "
+            "conservative local design points from the static-analysis constraints."
+        ),
+        solutions=solutions,
+        fallback_reason=reason,
+    )
+
+
+def _loop_function_name(loop_id: str) -> str:
+    return loop_id.rsplit(".loop_", 1)[0]
+
+
+def _run_scoped_solution_name(name: str, rank: int, strategy: str = "") -> str:
+    suffix = re.sub(
+        r"^(?:dp|design[_\s-]*point)\s*\d+[_\s-]*",
+        "",
+        name,
+        flags=re.IGNORECASE,
+    )
+    suffix = suffix.strip("_ -")
+    if not suffix or suffix.lower() == "candidate":
+        words = re.findall(r"[A-Za-z0-9]+", strategy.lower())
+        suffix = "_".join(words[:5]) or "generated_design"
+    return f"dp{rank:02d}_{suffix}"

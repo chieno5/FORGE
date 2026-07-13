@@ -94,27 +94,36 @@ def write_experiment_reports(
     write_data_report({"experiments": results}, json_path)
 
     fields = [
-        "name", "kind", "status", "latency_cycles", "initiation_interval",
+        "name", "kind", "status", "latency_source", "latency_cycles",
+        "hls_latency_cycles", "cosim_latency_cycles", "initiation_interval",
         "clock_period_ns", "runtime_ns", "performance", "power_w", "energy_nj",
         "lut", "ff", "bram", "dsp", "performance_norm", "power_norm",
         "energy_norm", "lut_norm", "efficiency_score", "package_path", "error",
+        "pragma_validation_status",
     ]
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
-        writer.writerows({key: item.get(key) for key in fields} for item in results)
+        writer.writerows(
+            {
+                **{key: item.get(key) for key in fields},
+                "pragma_validation_status": (item.get("pragma_validation") or {}).get("status"),
+            }
+            for item in results
+        )
 
     lines = [
         "# FORGE Experiment Results",
         "",
-        "| Design point | Status | Runtime (ns) | Power (W) | Energy (nJ) | LUT | Efficiency score |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+        "| Design point | Status | Latency source | Runtime (ns) | Power (W) | Energy (nJ) | LUT | Efficiency score |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for item in results:
         lines.append(
-            "| {name} | {status} | {runtime} | {power} | {energy} | {lut} | {score} |".format(
+            "| {name} | {status} | {latency_source} | {runtime} | {power} | {energy} | {lut} | {score} |".format(
                 name=item.get("name", ""),
                 status=item.get("status", ""),
+                latency_source=item.get("latency_source", ""),
                 runtime=_display_number(item.get("runtime_ns")),
                 power=_display_number(item.get("power_w")),
                 energy=_display_number(item.get("energy_nj")),

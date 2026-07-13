@@ -83,10 +83,12 @@ def _load_application_records(
             rationale = rationale_path.read_text(encoding="utf-8") if rationale_path.exists() else ""
         records.append(
             {
+                "source_group": f"initial:{application}:{experiment_set}",
                 "experiment_set": experiment_set,
-                "sort_index": experiment["sort_index"],
+                "design_order": experiment["sort_index"],
                 "design_point": point,
                 "role": experiment["role"],
+                "experiment_status": "completed",
                 "source_dir": str(source_dir),
                 "source_code": _read_design_source(source_dir) or benchmark_source,
                 "pragma_plan_json": json.dumps(plan or {"pragmas": []}, ensure_ascii=False),

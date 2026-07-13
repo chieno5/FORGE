@@ -27,7 +27,7 @@ class ToolInvocation:
     hls_style: str = "legacy"
 
     def hls_arguments(self, script: str) -> list[str]:
-        return ["--tcl", script] if self.hls_style == "vitis-run" else ["-f", script]
+        return ["--mode", "hls", "--tcl", script] if self.hls_style == "vitis-run" else ["-f", script]
 
 
 @dataclass(frozen=True)
@@ -47,6 +47,9 @@ class ExperimentResult:
     dsp: int | None
     power_w: float | None
     energy_nj: float | None
+    latency_source: str | None = None
+    hls_latency_cycles: float | None = None
+    cosim_latency_cycles: float | None = None
     efficiency_score: float | None = None
     performance_norm: float | None = None
     power_norm: float | None = None
@@ -57,6 +60,7 @@ class ExperimentResult:
     power_report: str | None = None
     package_path: str | None = None
     error: str | None = None
+    pragma_validation: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -153,25 +157,26 @@ def package_best_project(
     """Re-run the selected project, export its Vitis design, and create a zip archive."""
 
     project_dir = Path(result.project_directory).resolve()
+    workspace_dir = _workspace_directory(project_dir)
     vitis_hls, _ = resolve_toolchain(vitis_hls_command, None, amd_root)
     _emit(progress_callback, f"{result.name}: rerunning selected design for final package")
     _run_command(
         vitis_hls,
-        vitis_hls.hls_arguments("run_hls.tcl"),
-        project_dir,
-        "final_vitis_hls.log",
+        vitis_hls.hls_arguments(_workspace_script(project_dir, "run_hls.tcl")),
+        workspace_dir,
+        str(project_dir.relative_to(workspace_dir) / "final_vitis_hls.log"),
         tool_timeout_seconds,
         progress_callback,
         f"{result.name} | final Vitis HLS",
     )
     package_tcl = project_dir / "package_best.tcl"
     package_dir = project_dir / "package"
-    package_tcl.write_text(_package_tcl(top_function), encoding="utf-8")
+    package_tcl.write_text(_package_tcl(project_dir.name, top_function), encoding="utf-8")
     _run_command(
         vitis_hls,
-        vitis_hls.hls_arguments(package_tcl.name),
-        project_dir,
-        "package.log",
+        vitis_hls.hls_arguments(_workspace_script(project_dir, package_tcl.name)),
+        workspace_dir,
+        str(project_dir.relative_to(workspace_dir) / "package.log"),
         tool_timeout_seconds,
         progress_callback,
         f"{result.name} | Vitis package",
@@ -276,12 +281,13 @@ def _run_one(
     progress_callback: ProgressCallback | None,
 ) -> ExperimentResult:
     project_dir = Path(project.directory).resolve()
+    workspace_dir = _workspace_directory(project_dir)
     try:
         _run_command(
             vitis_hls,
-            vitis_hls.hls_arguments("run_hls.tcl"),
-            project_dir,
-            "vitis_hls.log",
+            vitis_hls.hls_arguments(_workspace_script(project_dir, "run_hls.tcl")),
+            workspace_dir,
+            str(project_dir.relative_to(workspace_dir) / "vitis_hls.log"),
             tool_timeout_seconds,
             progress_callback,
             f"{project.name} | Vitis HLS",
@@ -294,6 +300,52 @@ def _run_one(
         cosim_latency, cosim_interval = (
             parse_cosim_report(cosim_report) if cosim_report is not None else (None, None)
         )
+        pragma_validation = validate_pragma_effectiveness(
+            project,
+            hls_report,
+            project_dir / "vitis_hls.log",
+        )
+        hls_latency = _as_float(metrics["latency_cycles"])
+        use_cosim_latency = bool(getattr(project, "testbench", None)) and not bool(
+            getattr(project, "testbench_generated", False)
+        )
+        latency, initiation_interval, latency_source = _select_latency(
+            hls_latency,
+            _as_float(metrics["initiation_interval"]),
+            cosim_latency,
+            cosim_interval,
+            use_cosim_latency,
+        )
+        clock = _as_float(metrics["clock_period_ns"])
+        runtime_ns = latency * clock if latency is not None and clock is not None else None
+        performance = 1.0 / runtime_ns if runtime_ns and runtime_ns > 0 else None
+        if pragma_validation["status"] == "failed":
+            error = "Pragma validation failed: " + "; ".join(pragma_validation["issues"])
+            _emit(progress_callback, f"{project.name}: invalid - {error}")
+            return ExperimentResult(
+                name=project.name,
+                kind=project.kind,
+                project_directory=str(project_dir),
+                status="invalid",
+                latency_cycles=latency,
+                initiation_interval=initiation_interval,
+                clock_period_ns=clock,
+                runtime_ns=runtime_ns,
+                performance=performance,
+                lut=_as_int(metrics["lut"]),
+                ff=_as_int(metrics["ff"]),
+                bram=_as_int(metrics["bram"]),
+                dsp=_as_int(metrics["dsp"]),
+                power_w=None,
+                energy_nj=None,
+                latency_source=latency_source,
+                hls_latency_cycles=hls_latency,
+                cosim_latency_cycles=cosim_latency,
+                hls_report=str(hls_report),
+                cosim_report=str(cosim_report) if cosim_report else None,
+                error=error,
+                pragma_validation=pragma_validation,
+            )
         power_tcl = project_dir / "run_power.tcl"
         power_tcl.write_text(
             _power_tcl(
@@ -317,10 +369,6 @@ def _run_one(
         if not power_report.exists():
             raise VitisExecutionError("Vivado completed but power_report.rpt was not generated.")
         power_w = parse_power_report(power_report)
-        latency = _as_float(metrics["latency_cycles"]) or cosim_latency
-        clock = _as_float(metrics["clock_period_ns"])
-        runtime_ns = latency * clock if latency is not None and clock is not None else None
-        performance = 1.0 / runtime_ns if runtime_ns and runtime_ns > 0 else None
         energy_nj = power_w * runtime_ns if runtime_ns is not None else None
         return ExperimentResult(
             name=project.name,
@@ -328,7 +376,7 @@ def _run_one(
             project_directory=str(project_dir),
             status="completed",
             latency_cycles=latency,
-            initiation_interval=_as_float(metrics["initiation_interval"]) or cosim_interval,
+            initiation_interval=initiation_interval,
             clock_period_ns=clock,
             runtime_ns=runtime_ns,
             performance=performance,
@@ -338,9 +386,13 @@ def _run_one(
             dsp=_as_int(metrics["dsp"]),
             power_w=power_w,
             energy_nj=energy_nj,
+            latency_source=latency_source,
+            hls_latency_cycles=hls_latency,
+            cosim_latency_cycles=cosim_latency,
             hls_report=str(hls_report),
             cosim_report=str(cosim_report) if cosim_report else None,
             power_report=str(power_report),
+            pragma_validation=pragma_validation,
         )
     except VitisExecutionError as exc:
         _emit(progress_callback, f"{project.name}: failed - {exc}")
@@ -462,11 +514,184 @@ def _find_pattern(root: Path, pattern: str) -> Path | None:
     return found[0] if found else None
 
 
+def validate_pragma_effectiveness(
+    project: Any,
+    csynth_report: str | Path,
+    hls_log: str | Path,
+) -> dict[str, Any]:
+    """Verify that requested generated pragmas survived HLS and affected their target."""
+
+    pragmas = list(getattr(project, "pragmas", []) or [])
+    if not pragmas:
+        return {
+            "status": "not_applicable",
+            "requested": 0,
+            "validated": 0,
+            "details": [],
+            "issues": [],
+            "warnings": [],
+        }
+
+    root = ET.parse(csynth_report).getroot()
+    report_pragmas = list(root.findall(".//PragmaReport/Pragma"))
+    statuses_by_type: dict[str, list[str]] = {}
+    for pragma in report_pragmas:
+        pragma_type = pragma.attrib.get("type", "").upper()
+        statuses_by_type.setdefault(pragma_type, []).append(
+            pragma.attrib.get("status", "unknown").lower()
+        )
+    log_text = Path(hls_log).read_text(encoding="utf-8", errors="ignore") if Path(hls_log).exists() else ""
+    pipeline_results = _pipeline_results(log_text)
+    used_statuses: dict[str, int] = {}
+    details: list[dict[str, Any]] = []
+    issues: list[str] = []
+    warnings: list[str] = []
+
+    for directive in pragmas:
+        pragma_text = str(directive.get("pragma", ""))
+        directive_name = _directive_name(pragma_text)
+        detail: dict[str, Any] = {
+            "pragma": pragma_text,
+            "target_function": directive.get("target_function", ""),
+            "target_loop_id": directive.get("target_loop_id", ""),
+            "status": "validated",
+        }
+        statuses = statuses_by_type.get(directive_name, [])
+        used = used_statuses.get(directive_name, 0)
+        status = statuses[used] if used < len(statuses) else None
+        used_statuses[directive_name] = used + 1
+        if status != "valid":
+            message = f"{directive_name} was not accepted by csynth"
+            detail.update({"status": "invalid", "message": message})
+            issues.append(message)
+            details.append(detail)
+            continue
+
+        if directive_name == "ALLOCATION":
+            operation = _pragma_word_option(pragma_text, "instances")
+            if operation and re.search(
+                rf"cannot find any operation of ['\"]?{re.escape(operation)}['\"]?",
+                log_text,
+                flags=re.IGNORECASE,
+            ):
+                message = f"ALLOCATION did not match any '{operation}' operation in Vitis HLS"
+                detail.update({"status": "invalid", "message": message})
+                issues.append(message)
+        elif directive_name == "UNROLL" and re.search(
+            r"unroll pragma is ignored", log_text, flags=re.IGNORECASE
+        ):
+            message = "UNROLL was ignored by Vitis HLS"
+            detail.update({"status": "invalid", "message": message})
+            issues.append(message)
+        elif directive_name == "PIPELINE":
+            token = _pipeline_loop_token(project, pragma_text)
+            result = next(
+                (item for item in pipeline_results if token and token in item["loop"]),
+                None,
+            )
+            if result is None:
+                message = "PIPELINE did not produce a pipelined target loop"
+                detail.update({"status": "invalid", "message": message})
+                issues.append(message)
+            else:
+                requested_ii = _pragma_integer_option(pragma_text, "II")
+                detail["target_ii"] = requested_ii
+                detail["actual_ii"] = result["final_ii"]
+                detail["hls_loop"] = result["loop"]
+                if requested_ii is not None and result["final_ii"] > requested_ii:
+                    detail["status"] = "degraded"
+                    message = (
+                        f"PIPELINE target II={requested_ii} reached final II={result['final_ii']}"
+                    )
+                    detail["message"] = message
+                    warnings.append(message)
+        details.append(detail)
+
+    return {
+        "status": "failed" if issues else "passed",
+        "requested": len(pragmas),
+        "validated": sum(item["status"] != "invalid" for item in details),
+        "details": details,
+        "issues": issues,
+        "warnings": warnings,
+    }
+
+
+def _directive_name(pragma: str) -> str:
+    parts = pragma.split()
+    return parts[2].upper() if len(parts) >= 3 else ""
+
+
+def _pipeline_results(log_text: str) -> list[dict[str, Any]]:
+    pattern = re.compile(
+        r"Pipelining result\s*:\s*Target II\s*=\s*([^,]+),\s*"
+        r"Final II\s*=\s*(\d+).*?loop\s+'([^']+)'",
+        flags=re.IGNORECASE,
+    )
+    return [
+        {"target_ii": match.group(1).strip(), "final_ii": int(match.group(2)), "loop": match.group(3)}
+        for match in pattern.finditer(log_text)
+    ]
+
+
+def _pipeline_loop_token(project: Any, pragma_text: str) -> str | None:
+    source_file = Path(getattr(project, "source_file", ""))
+    if not source_file.is_file():
+        return None
+    lines = source_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() != pragma_text:
+            continue
+        for loop_line in range(index - 1, -1, -1):
+            if re.search(r"\b(?:for|while)\s*\(|\bdo\b", lines[loop_line]):
+                return f"VITIS_LOOP_{loop_line + 1}_"
+    return None
+
+
+def _pragma_integer_option(pragma: str, option: str) -> int | None:
+    match = re.search(rf"\b{re.escape(option)}\s*=\s*(\d+)", pragma, flags=re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _pragma_word_option(pragma: str, option: str) -> str | None:
+    match = re.search(rf"\b{re.escape(option)}\s*=\s*([A-Za-z_]\w*)", pragma)
+    return match.group(1) if match else None
+
+
+def _select_latency(
+    hls_latency: float | None,
+    hls_interval: float | None,
+    cosim_latency: float | None,
+    cosim_interval: float | None,
+    use_cosim_latency: bool,
+) -> tuple[float | None, float | None, str | None]:
+    if use_cosim_latency and cosim_latency is not None:
+        return cosim_latency, cosim_interval or hls_interval, "cosim"
+    if hls_latency is not None:
+        return hls_latency, hls_interval or cosim_interval, "hls_worst_case"
+    if cosim_latency is not None:
+        return cosim_latency, cosim_interval, "cosim_fallback"
+    return None, hls_interval or cosim_interval, None
+
+
+def _workspace_directory(project_dir: Path) -> Path:
+    """A FORGE source folder is one Vitis workspace with sibling components."""
+
+    return project_dir.parent
+
+
+def _workspace_script(project_dir: Path, script_name: str) -> str:
+    return str(Path(project_dir.name) / script_name)
+
+
 def _power_tcl(top_function: str, part: str, clock_period_ns: float = 10.0) -> str:
     return "\n".join(
         [
             "set script_dir [file dirname [file normalize [info script]]]",
-            "set rtl_files [glob -nocomplain -directory $script_dir/vitis_project/solution1/syn/verilog *.v]",
+            "set rtl_files [glob -nocomplain -directory $script_dir/hls/syn/verilog *.v]",
+            "if {[llength $rtl_files] == 0} {",
+            "    set rtl_files [glob -nocomplain -directory $script_dir/vitis_project/solution1/syn/verilog *.v]",
+            "}",
             "if {[llength $rtl_files] == 0} { error {No RTL Verilog files were generated by Vitis HLS.} }",
             "read_verilog $rtl_files",
             f"synth_design -top {{{top_function}}} -part {{{part}}}",
@@ -477,13 +702,12 @@ def _power_tcl(top_function: str, part: str, clock_period_ns: float = 10.0) -> s
     ) + "\n"
 
 
-def _package_tcl(top_function: str) -> str:
+def _package_tcl(component_name: str, top_function: str) -> str:
     return "\n".join(
         [
-            "set script_dir [file dirname [file normalize [info script]]]",
-            "open_project [file join $script_dir vitis_project]",
-            "open_solution solution1",
+            f"open_component {component_name}",
             f"set_top {top_function}",
+            "set script_dir [file dirname [file normalize [info script]]]",
             "export_design -format ip_catalog -output [file join $script_dir package]",
             "exit",
         ]

@@ -59,11 +59,15 @@ python forge.py examples/vision_pipeline.c
 
 Passing only a C file runs static analysis only. It does not call OpenAI or AMD
 tools. The static candidate threshold is fixed internally at `60`; the complete
-static report is still sent to OpenAI when AI recommendation is requested.
+static report and original C source are sent to OpenAI when AI recommendation is requested.
 If a returned pragma plan fails FORGE validation, FORGE sends the validation
-error back to OpenAI and retries automatically, up to three total attempts.
+error back to OpenAI and retries automatically, up to three total attempts. If
+all replies remain invalid, FORGE continues with conservative local design
+points built from the analyzed loop and array constraints.
 FORGE recursively resolves local quoted headers such as `#include "kernel.h"`;
 use `--include-dir` only when a required header is outside the source directory.
+Each analysis run numbers its generated candidates from `dp01`, independent of
+historical experiments for the same application.
 
 Interactive mode:
 
@@ -156,10 +160,17 @@ AI recommendation and generation summary:
 report/<source_name>_pragma_report.json
 ```
 
-## Test Database
+## Demo Database
 
-`forge_test.py` uses `data/forge_test.db` instead of the main database. It is
-intended for isolated experiments while preserving `data/forge.db`.
+During the demo stage, normal FORGE runs use `data/forge_test.db` by default.
+`forge_test.py` remains available as an equivalent explicit entry point.
+
+For a formal demonstration, change `[database].path` in `forge.toml` to
+`data/forge.db`, or override one command with:
+
+```powershell
+forge examples/fir_filter_example.c --database data/forge.db
+```
 
 Generated Vitis folders:
 
@@ -176,10 +187,18 @@ Each generated option contains:
 ```text
 src/<source_file>.c
 project.json
+vitis-comp.json
+hls_config.cfg
 run_hls.tcl
 run_hls.bat
 tb/<testbench>.c      # only with --testbench or --auto-testbench
 ```
+
+`generated/<source_name>/` is a Vitis Unified IDE workspace. Each baseline or
+design point is an HLS component, so open this source-level folder as the Vitis
+workspace to see all generated components together. `forge_workspace.json`
+lists the component folders created by FORGE. The component metadata is written
+during `--generate`; Vitis updates it again when the HLS script runs.
 
 The baseline source has no new pragmas. Each solution source contains one
 coordinated pragma set. If the input source contains a non-top `main` function,
@@ -188,10 +207,13 @@ testbench.
 
 When `--run-vitis` is used, each project receives execution logs, HLS reports,
 and a Vivado `power_report.rpt`. FORGE writes the final ranking to the pragma
-report, archives all measurements in `data/forge.db`, and creates a ZIP archive
+report, archives all measurements in the configured database, and creates a ZIP archive
 for the best solution. `data/` is local history and is ignored by Git.
 `--run-vitis` requires `--testbench` or `--auto-testbench`, so the final run
 includes `csim` and `cosim`.
+When a user supplies `--testbench`, efficiency scoring uses its measured cosim
+latency. `--auto-testbench` remains a smoke test, so scoring uses worst-case
+HLS latency while retaining the cosim measurement in the reports.
 The baseline participates in this ranking and is kept as the final result when
 every generated candidate has a lower efficiency score.
 
@@ -206,10 +228,15 @@ report/<source_name>_experiment_results.md
 FORGE prints concise stage updates for C simulation, C synthesis, co-simulation,
 and Vivado power estimation. Detailed tool output remains in each project's log
 files. Unsafe AI recommendations that pipeline non-innermost loops or override
-an existing source interface pragma are rejected before Vitis execution.
+an existing source interface pragma are rejected before Vitis execution. FORGE
+also identifies loop-carried array dependencies during static analysis and does
+not allow direct `PIPELINE` or `UNROLL` recommendations for those loops.
+After `csynth`, FORGE verifies generated pragmas against the HLS report and log.
+An ignored pragma or a pipeline that did not create its target loop is marked
+`invalid`, skipped for power estimation, and excluded from efficiency ranking.
 
 On Windows, FORGE automatically detects `C:\AMDDesignTools\<version>` and starts
-tools through `Vitis\settings64.bat`. AMD 2025.2 uses `vitis-run --tcl` for HLS;
+tools through `Vitis\settings64.bat`. AMD 2025.2 uses `vitis-run --mode hls --tcl` for HLS;
 older installations can still be supplied with `--vitis-hls`.
 
 ## Testbench Notes
@@ -226,6 +253,18 @@ product, and 2D convolution patterns. Each classification selects matching
 history from the local SQLite database before AI recommendation. Imported
 history and completed FORGE experiments are combined before being sent to AI.
 Unrecognized code uses a separate generic history group.
+
+FORGE stores every pragma target, directive, and directive-level rationale in
+`pragma_plan_json`, plus the design-point strategy, expected effect, and risk.
+For the same exact source, previously tried non-baseline pragma plans are sent
+to AI as experimental context. FORGE prevents duplicates inside one new batch,
+while allowing an earlier plan to be selected again for verification.
+
+Each application history row includes a stable `source_group` for one exact C
+source, an `experiment_set` for one FORGE run, and `design_order` for baseline
+and design-point display order. Invalid runs are retained for diagnosis but are
+not sent to AI history or included in efficiency ranking. Target FPGA part,
+target clock, and the measured HLS clock are stored separately.
 
 Import the validated pragma exploration history into five application tables:
 

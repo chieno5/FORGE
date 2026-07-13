@@ -43,7 +43,7 @@ PROJECT_NAME = "FORGE: FPGA Optimization and Reconfiguration Generation Engine"
 DEFAULT_THRESHOLD = 60
 REPORT_DIR = Path("report")
 DEFAULT_OUTPUT_ROOT = Path("generated")
-DEFAULT_DATABASE = Path("data") / "forge.db"
+DEFAULT_DATABASE = Path("data") / "forge_test.db"
 CONFIG_PATH = Path("forge.toml")
 ASCII_LOGO = """
  ███████╗ ██████╗ ██████╗  ██████╗ ███████╗
@@ -263,7 +263,11 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
             clock_period_ns=clock_period_ns,
             design_point_count=args.design_points,
             model=model,
-            experience_context=database.history_context(application.key),
+            experience_context=database.history_context(
+                application.key,
+                source_path=args.input,
+                source_text=source_text,
+            ),
             retry_callback=_print_ai_retry,
             source_text=source_text,
         )
@@ -274,6 +278,10 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
     _print_tool_progress(
         f"AI recommendation: received {len(ai_result.solutions)} design points"
     )
+    if ai_result.fallback_reason:
+        _print_tool_progress(
+            "AI recommendation: using local safe fallback after invalid AI responses"
+        )
     _print_ai_summary(ai_result.summary, ai_result.solutions)
 
     run = database.create_run(

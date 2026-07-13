@@ -39,12 +39,16 @@ def generate_local_testbench(
 ) -> TestbenchSource:
     specs = [_parse_parameter(parameter) for parameter in top_function.parameters]
     typedefs = _extract_typedefs(source_text)
+    defines = _extract_defines(source_text)
     lines: list[str] = [
         "/* Auto-generated smoke testbench for Vitis HLS. */",
         "#include <stdint.h>",
     ]
     lines.extend(_extract_local_includes(source_text))
     lines.append("")
+    if defines:
+        lines.extend(defines)
+        lines.append("")
     if typedefs:
         lines.extend(typedefs)
         lines.append("")
@@ -170,6 +174,14 @@ def _parse_parameter(parameter: str) -> ParameterSpec:
 
 def _extract_typedefs(source_text: str) -> list[str]:
     return re.findall(r"^\s*typedef\b[^;]*;", source_text, flags=re.MULTILINE)
+
+
+def _extract_defines(source_text: str) -> list[str]:
+    return re.findall(
+        r"^\s*#define\s+[A-Za-z_]\w*(?:\([^\n)]*\))?[^\n]*",
+        source_text,
+        flags=re.MULTILINE,
+    )
 
 
 def _extract_local_includes(source_text: str) -> list[str]:

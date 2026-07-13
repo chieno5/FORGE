@@ -98,9 +98,10 @@ def _has_regular_array_arithmetic_loop(features: dict[str, Any]) -> bool:
 
 def _recommendations(features: dict[str, Any]) -> list[str]:
     recommendations: list[str] = []
-    if features["loop_count"] > 0:
+    dependency_limited = features.get("has_loop_carried_dependency", False)
+    if features["loop_count"] > 0 and not dependency_limited:
         recommendations.append("pipeline")
-    if features["max_loop_depth"] >= 2:
+    if features["max_loop_depth"] >= 2 and not dependency_limited:
         recommendations.append("loop_unroll_for_small_fixed_bounds")
     if features["array_access_count"] >= 4 and features["has_regular_memory_access"]:
         recommendations.append("array_partition")
@@ -108,6 +109,8 @@ def _recommendations(features: dict[str, Any]) -> list[str]:
         recommendations.append("dataflow")
     if features["has_reduction_pattern"]:
         recommendations.append("reduction_optimization")
+    if dependency_limited:
+        recommendations.append("dependency_aware_buffer_or_shift_register_refactor")
     if not recommendations:
         recommendations.append("keep_on_cpu_or_refactor_before_hls")
     return recommendations
@@ -145,6 +148,10 @@ def _reasoning(
         negatives.append("control-heavy structure")
     if features["unknown_function_call_count"] >= 3:
         negatives.append("many unknown function calls")
+    if features.get("has_loop_carried_dependency", False):
+        arrays = features.get("dependency_arrays", [])
+        detail = f" on {', '.join(arrays)}" if arrays else ""
+        negatives.append(f"loop-carried memory dependency{detail}")
 
     positive_text = ", ".join(positives) if positives else "limited compute-friendly structure"
     if negatives:

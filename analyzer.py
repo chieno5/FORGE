@@ -244,12 +244,14 @@ class LoopCollector(c_ast.NodeVisitor):
         state = FeatureState(self.function_name, self.function_names)
         FeatureVisitor(state, initial_loop_depth=self.loop_depth - 1).visit(node)
         loop_id = f"{self.function_name}.loop_{self.loop_index}"
+        features = state.to_features()
+        features.update(_loop_memory_dependency_features(node))
         self.loop_regions.append(
             LoopRegion(
                 id=loop_id,
                 kind=kind,
                 depth=self.loop_depth,
-                features=state.to_features(),
+                features=features,
                 source_line=node.coord.line if node.coord else 0,
             )
         )
@@ -320,3 +322,144 @@ def _is_regular_subscript(node: c_ast.Node | None) -> bool:
     if isinstance(node, c_ast.UnaryOp) and node.op in {"+", "-"}:
         return _is_regular_subscript(node.expr)
     return False
+
+
+class _LoopMemoryAccessVisitor(c_ast.NodeVisitor):
+    """Collect direct array reads and writes from one loop body."""
+
+    def __init__(self, iterator_name: str | None):
+        self.iterator_name = iterator_name
+        self.reads: list[tuple[str, int | None]] = []
+        self.writes: list[tuple[str, int | None]] = []
+
+    def visit_Assignment(self, node: c_ast.Assignment) -> None:
+        self._record_write(node.lvalue)
+        if node.op != "=":
+            self._record_reads(node.lvalue)
+        self._record_reads(node.rvalue)
+
+    def visit_Decl(self, node: c_ast.Decl) -> None:
+        self._record_reads(node.init)
+
+    def _record_write(self, node: c_ast.Node | None) -> None:
+        access = _array_access(node, self.iterator_name)
+        if access is not None:
+            self.writes.append(access)
+
+    def _record_reads(self, node: c_ast.Node | None) -> None:
+        if node is None:
+            return
+        for array_ref in _array_references(node):
+            access = _array_access(array_ref, self.iterator_name)
+            if access is not None:
+                self.reads.append(access)
+
+
+def _loop_memory_dependency_features(node: c_ast.Node) -> dict[str, Any]:
+    iterator_name = _loop_iterator_name(node)
+    visitor = _LoopMemoryAccessVisitor(iterator_name)
+    body = getattr(node, "stmt", None)
+    if body is not None:
+        visitor.visit(body)
+
+    read_arrays = {name for name, _ in visitor.reads}
+    write_arrays = {name for name, _ in visitor.writes}
+    shared_arrays = read_arrays & write_arrays
+    carried_arrays = {
+        name
+        for name, offset in visitor.reads
+        if name in write_arrays and offset is not None and offset < 0
+    }
+    has_dependency = bool(carried_arrays)
+    has_neighbor_access = any(
+        offset is not None and offset != 0
+        for _, offset in [*visitor.reads, *visitor.writes]
+    )
+    notes: list[str] = []
+    if shared_arrays:
+        notes.append(f"same array read and write: {', '.join(sorted(shared_arrays))}")
+    if carried_arrays:
+        notes.append(
+            "loop-carried read after previous write: "
+            f"{', '.join(sorted(carried_arrays))}"
+        )
+    if _has_variable_trip_count(node, iterator_name):
+        notes.append("variable loop trip count")
+    return {
+        "memory_read_arrays": sorted(read_arrays),
+        "memory_write_arrays": sorted(write_arrays),
+        "has_same_array_read_write": bool(shared_arrays),
+        "has_neighbor_index_access": has_neighbor_access,
+        "has_loop_carried_dependency": has_dependency,
+        "dependency_arrays": sorted(carried_arrays),
+        "has_variable_trip_count": _has_variable_trip_count(node, iterator_name),
+        "pipeline_eligible": not has_dependency,
+        "unroll_eligible": not has_dependency,
+        "dependency_notes": notes,
+    }
+
+
+def _loop_iterator_name(node: c_ast.Node) -> str | None:
+    if not isinstance(node, c_ast.For):
+        return None
+    if isinstance(node.init, c_ast.DeclList) and node.init.decls:
+        return node.init.decls[0].name
+    if isinstance(node.init, c_ast.Assignment) and isinstance(node.init.lvalue, c_ast.ID):
+        return node.init.lvalue.name
+    return None
+
+
+def _has_variable_trip_count(node: c_ast.Node, iterator_name: str | None) -> bool:
+    if not isinstance(node, c_ast.For) or node.cond is None:
+        return True
+    return any(
+        identifier.name != iterator_name
+        for identifier in _nodes_of_type(node.cond, c_ast.ID)
+    )
+
+
+def _array_references(node: c_ast.Node) -> list[c_ast.ArrayRef]:
+    return list(_nodes_of_type(node, c_ast.ArrayRef))
+
+
+def _nodes_of_type(node: c_ast.Node, node_type: type[c_ast.Node]) -> list[c_ast.Node]:
+    found: list[c_ast.Node] = []
+
+    class Visitor(c_ast.NodeVisitor):
+        def generic_visit(self, current: c_ast.Node) -> None:
+            if isinstance(current, node_type):
+                found.append(current)
+            super().generic_visit(current)
+
+    Visitor().visit(node)
+    return found
+
+
+def _array_access(
+    node: c_ast.Node | None,
+    iterator_name: str | None,
+) -> tuple[str, int | None] | None:
+    if not isinstance(node, c_ast.ArrayRef):
+        return None
+    base = node
+    while isinstance(base, c_ast.ArrayRef):
+        base = base.name
+    if not isinstance(base, c_ast.ID):
+        return None
+    return base.name, _index_offset(node.subscript, iterator_name)
+
+
+def _index_offset(node: c_ast.Node | None, iterator_name: str | None) -> int | None:
+    if not iterator_name or node is None:
+        return None
+    if isinstance(node, c_ast.ID) and node.name == iterator_name:
+        return 0
+    if isinstance(node, c_ast.BinaryOp) and node.op in {"+", "-"}:
+        if isinstance(node.left, c_ast.ID) and node.left.name == iterator_name:
+            if isinstance(node.right, c_ast.Constant) and node.right.type == "int":
+                try:
+                    value = int(node.right.value, 0)
+                except ValueError:
+                    return None
+                return value if node.op == "+" else -value
+    return None
