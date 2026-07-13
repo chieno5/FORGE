@@ -16,10 +16,11 @@ ENERGY_EFFICIENCY_OBJECTIVE = (
     "(minimize candidate energy multiplied by LUT use relative to baseline)"
 )
 # This subset is intentionally smaller than the full Vitis HLS pragma language.
-# It keeps unattended exploration within directives we can safely validate.
+# Each directive has a structural validation rule before FORGE generates a project.
 AUTO_GENERATION_DIRECTIVES = {
     "ALLOCATION",
     "ARRAY_PARTITION",
+    "ARRAY_RESHAPE",
     "INLINE",
     "PIPELINE",
     "UNROLL",
@@ -126,12 +127,12 @@ SYSTEM_PROMPT = """You are a Vitis HLS optimisation expert working inside FORGE.
 Create the requested number of distinct whole-design design points for energy-LUT exploration.
 Every solution becomes a complete Vitis project and should contain 2 to 4 coordinated pragmas
 across the top function and its analyzed helper functions when the source structure supports it.
-The later selection metric is efficiency_score based on energy and LUT after Vitis reports are available.
-Balance latency, initiation interval, resource growth and expected switching activity. Do not optimize
-only for raw performance or only for low power.
+The sole selection metric is efficiency_score based on energy and LUT after Vitis reports are available.
+Use latency, initiation interval, resource growth and expected switching activity only as ways to reduce
+candidate energy multiplied by LUT use. Do not optimize only for raw performance or only for low power.
 Use only valid '#pragma HLS ...' syntax and loop IDs present in the input JSON.
 Only use these automatic-exploration directives: PIPELINE, UNROLL, ARRAY_PARTITION,
-ALLOCATION and INLINE. Never use BIND_STORAGE, INTERFACE, DATAFLOW, ARRAY_RESHAPE,
+ARRAY_RESHAPE, ALLOCATION and INLINE. Never use BIND_STORAGE, INTERFACE, DATAFLOW,
 BIND_OP, RESOURCE, DEPENDENCE or any directive not in that list.
 Write directive names in uppercase. Use an empty target_loop_id for function-level pragmas.
 Do not invent functions, loops or array names. Do not repeat or contradict pragmas in one solution.
@@ -141,6 +142,11 @@ Never apply PIPELINE to a function or to a loop that contains deeper nested loop
 only allowed on an innermost analyzed loop. Do not apply ARRAY_PARTITION complete to an external
 function argument. For ARRAY_PARTITION, use a supplied array parameter, cyclic/block style,
 factor 2, 4 or 8, and dim=1.
+For ARRAY_RESHAPE, use only a supplied array parameter, cyclic/block style, factor 2, 4 or 8,
+and dim=1. Never use complete reshaping. Use ALLOCATION only on a function listed in
+allocation_allowed_functions, with no loop target and exactly `operation instances=mul limit=N`
+where N is 1, 2 or 4. ALLOCATION is a resource-sharing alternative: use it in at most one
+solution in a batch, and do not use it when lower-risk loop or memory options are sufficient.
 The input contains pipeline_allowed_loop_ids and unroll_allowed_loop_ids. Use PIPELINE or UNROLL
 only on the corresponding exact loop IDs. Do not apply either directive to a loop marked with a
 loop-carried dependency; recommend a refactor-oriented function-level alternative instead.
@@ -161,6 +167,7 @@ def recommend_solutions(
     experience_context: dict[str, Any] | None = None,
     retry_callback: Callable[[int, str], None] | None = None,
     source_text: str | None = None,
+    exploration_mode: str = "explore",
 ) -> AIRecommendationResult:
     selected_model = model or DEFAULT_MODEL
     if client is None:
@@ -179,6 +186,8 @@ def recommend_solutions(
 
     if design_point_count < 1:
         raise AIRecommendationError("design_point_count must be at least 1.")
+    if exploration_mode not in {"explore", "verify"}:
+        raise AIRecommendationError("exploration_mode must be 'explore' or 'verify'.")
 
     request_payload = _build_request_payload(
         report=report,
@@ -188,6 +197,7 @@ def recommend_solutions(
         experience_context=experience_context,
         design_point_count=design_point_count,
         source_text=source_text,
+        exploration_mode=exploration_mode,
     )
 
     correction: str | None = None
@@ -196,6 +206,19 @@ def recommend_solutions(
             f"{SYSTEM_PROMPT}\nReturn exactly {design_point_count} solutions, "
             f"ranked consecutively from 1 to {design_point_count}."
         )
+        if exploration_mode == "explore":
+            instructions += (
+                "\nThis is an exploration batch for one unchanged experiment context. "
+                "Do not return an exact pragma plan listed in current_source_plans. "
+                "If every earlier candidate was below baseline, return entirely novel plans. "
+                "If a candidate already exceeds baseline, return two novel plans and one "
+                "parameter-level refinement around the current best plan."
+            )
+        else:
+            instructions += (
+                "\nThis is a verification batch. Earlier plans may be repeated when their "
+                "strategy explains why a new measurement is useful."
+            )
         if correction:
             instructions += (
                 "\nThe previous response failed FORGE validation with this error:\n"
@@ -224,6 +247,8 @@ def recommend_solutions(
                 design_point_count=design_point_count,
                 source_text=source_text,
             )
+            if exploration_mode == "explore":
+                _reject_current_context_duplicates(solutions, experience_context)
         except (TypeError, json.JSONDecodeError) as exc:
             correction = "OpenAI did not return valid JSON."
         except AIRecommendationError as exc:
@@ -247,6 +272,7 @@ def recommend_solutions(
             design_point_count,
             selected_model,
             correction or "OpenAI did not return a usable recommendation.",
+            _previous_plan_signatures(experience_context) if exploration_mode == "explore" else set(),
         )
 
     raise AssertionError("Recommendation retry loop unexpectedly completed.")
@@ -342,6 +368,7 @@ def _build_request_payload(
     experience_context: dict[str, Any] | None,
     design_point_count: int,
     source_text: str | None,
+    exploration_mode: str,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "project": "FORGE: FPGA Optimization and Reconfiguration Generation Engine",
@@ -350,6 +377,7 @@ def _build_request_payload(
         "target_part": part,
         "clock_period_ns": clock_period_ns,
         "design_point_count": design_point_count,
+        "exploration_mode": exploration_mode,
         "source_code": source_text or "",
         "static_analysis": report.to_dict(),
         "pragma_constraints": {
@@ -358,7 +386,12 @@ def _build_request_payload(
             "unroll_allowed_loop_ids": _unroll_allowed_loop_ids(report),
             "dependency_restricted_loop_ids": _dependency_restricted_loop_ids(report),
             "array_partition_allowed_variables": _array_parameter_names(report),
-            "external_parameter_rules": ["ARRAY_PARTITION complete is not allowed."],
+            "array_reshape_allowed_variables": _array_parameter_names(report),
+            "allocation_allowed_functions": _allocation_allowed_functions(report),
+            "external_parameter_rules": [
+                "ARRAY_PARTITION complete is not allowed.",
+                "ARRAY_RESHAPE complete is not allowed.",
+            ],
         },
     }
     if experience_context:
@@ -451,16 +484,29 @@ def _validate_directive(
             raise AIRecommendationError(
                 f"UNROLL target has a loop-carried dependency: {directive.target_loop_id}"
             )
-    if name == "ARRAY_PARTITION":
+    if name in {"ARRAY_PARTITION", "ARRAY_RESHAPE"}:
         variable = _pragma_option(directive.pragma, "variable")
-        parameter_names = {_parameter_name(parameter) for parameter in target.parameters}
-        if (
-            variable
-            and variable in parameter_names
-            and _is_complete_array_partition(directive.pragma)
-        ):
+        array_parameters = _array_parameter_names_for_function(target)
+        if not variable or variable not in array_parameters:
             raise AIRecommendationError(
-                f"ARRAY_PARTITION complete cannot target external function parameter: {variable}"
+                f"{name} must target a supplied array parameter: {variable or '<missing>'}"
+            )
+        if _is_complete_array_partition(directive.pragma):
+            raise AIRecommendationError(
+                f"{name} complete cannot target external function parameter: {variable}"
+            )
+    if name == "ALLOCATION":
+        operation = _pragma_option(directive.pragma, "instances")
+        limit = _pragma_integer_option(directive.pragma, "limit")
+        if directive.target_loop_id:
+            raise AIRecommendationError("ALLOCATION must target a function, not a loop.")
+        if not target.features.get("has_multiplication", False):
+            raise AIRecommendationError(
+                f"ALLOCATION is only allowed for a function with multiplication: {target.name}"
+            )
+        if operation != "mul" or limit not in {1, 2, 4}:
+            raise AIRecommendationError(
+                "ALLOCATION must use operation instances=mul with limit 1, 2 or 4."
             )
     if name == "INTERFACE":
         port = _pragma_option(directive.pragma, "port")
@@ -518,14 +564,26 @@ def _dependency_restricted_loop_ids(report: AnalysisReport) -> dict[str, list[st
 
 def _array_parameter_names(report: AnalysisReport) -> dict[str, list[str]]:
     return {
-        function.name: [
-            name
-            for parameter in function.parameters
-            if (name := _parameter_name(parameter))
-            and ("[" in parameter or "*" in parameter)
-        ]
+        function.name: _array_parameter_names_for_function(function)
         for function in report.functions
     }
+
+
+def _array_parameter_names_for_function(function: Any) -> list[str]:
+    return [
+        name
+        for parameter in function.parameters
+        if (name := _parameter_name(parameter))
+        and ("[" in parameter or "*" in parameter)
+    ]
+
+
+def _allocation_allowed_functions(report: AnalysisReport) -> list[str]:
+    return [
+        function.name
+        for function in report.functions
+        if function.features.get("has_multiplication", False)
+    ]
 
 
 def _is_innermost_loop(loop_regions: list[Any], loop_id: str) -> bool:
@@ -544,6 +602,11 @@ def _is_innermost_loop(loop_regions: list[Any], loop_id: str) -> bool:
 def _pragma_option(pragma: str, option: str) -> str | None:
     match = re.search(rf"\b{re.escape(option)}\s*=\s*([A-Za-z_]\w*)", pragma)
     return match.group(1) if match else None
+
+
+def _pragma_integer_option(pragma: str, option: str) -> int | None:
+    match = re.search(rf"\b{re.escape(option)}\s*=\s*(\d+)", pragma)
+    return int(match.group(1)) if match else None
 
 
 def _is_complete_array_partition(pragma: str) -> bool:
@@ -573,6 +636,7 @@ def _fallback_recommendations(
     design_point_count: int,
     model: str,
     reason: str,
+    excluded_plan_signatures: set[tuple[tuple[str, str, str], ...]],
 ) -> AIRecommendationResult:
     """Create conservative design points when the remote response stays unusable."""
 
@@ -598,8 +662,9 @@ def _fallback_recommendations(
     ]
     solutions: list[OptimizationSolution] = []
 
+    variation_offset = len(excluded_plan_signatures)
     for rank in range(1, design_point_count + 1):
-        variation = rank - 1
+        variation = rank - 1 + variation_offset
         pragmas: list[PragmaDirective] = []
         use_unroll = bool(unroll_loops) and (not pipeline_loops or variation % 3 == 2)
         if use_unroll:
@@ -638,17 +703,6 @@ def _fallback_recommendations(
                     "Local fallback uses a bounded cyclic partition on an array parameter.",
                 )
             )
-        else:
-            pragmas.append(
-                PragmaDirective(
-                    top_function,
-                    "",
-                    "#pragma HLS ALLOCATION "
-                    f"operation instances=mul limit={1 + variation}",
-                    "Local fallback bounds multiplier sharing when no array parameter is available.",
-                )
-            )
-
         if len(pragmas) < 2:
             pragmas.append(
                 PragmaDirective(
@@ -683,6 +737,48 @@ def _fallback_recommendations(
 
 def _loop_function_name(loop_id: str) -> str:
     return loop_id.rsplit(".loop_", 1)[0]
+
+
+def _previous_plan_signatures(
+    experience_context: dict[str, Any] | None,
+) -> set[tuple[tuple[str, str, str], ...]]:
+    if not experience_context:
+        return set()
+    return {
+        _pragma_plan_signature(item.get("pragmas", []))
+        for item in experience_context.get("current_source_plans", [])
+        if isinstance(item, dict)
+    }
+
+
+def _reject_current_context_duplicates(
+    solutions: list[OptimizationSolution],
+    experience_context: dict[str, Any] | None,
+) -> None:
+    previous = _previous_plan_signatures(experience_context)
+    for solution in solutions:
+        if _pragma_plan_signature(solution.pragmas) in previous:
+            raise AIRecommendationError(
+                f"AI repeated a completed pragma plan in exploration mode: {solution.name}"
+            )
+
+
+def _pragma_plan_signature(pragmas: list[Any]) -> tuple[tuple[str, str, str], ...]:
+    entries: list[tuple[str, str, str]] = []
+    for pragma in pragmas:
+        if isinstance(pragma, PragmaDirective):
+            entries.append((pragma.target_function, pragma.target_loop_id, pragma.pragma))
+        elif isinstance(pragma, dict):
+            entries.append(
+                (
+                    str(pragma.get("target_function", "")),
+                    str(pragma.get("target_loop_id", "")),
+                    _normalize_pragma(str(pragma.get("pragma", ""))),
+                )
+            )
+        else:
+            entries.append(("", "", _normalize_pragma(str(pragma))))
+    return tuple(sorted(entries))
 
 
 def _run_scoped_solution_name(name: str, rank: int, strategy: str = "") -> str:

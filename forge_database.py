@@ -22,7 +22,7 @@ INITIAL_VALIDATED_SOURCE = "initial_validated"
 FORGE_RUN_SOURCE = "forge_run"
 
 HISTORY_COLUMNS = [
-    "source_type", "source_group", "experiment_set", "design_order", "design_point", "role",
+    "source_type", "source_group", "evaluation_context_key", "experiment_set", "design_order", "design_point", "role",
     "experiment_status", "source_dir",
     "source_code", "pragma_plan_json", "rationale", "run_dir", "report_dir",
     "target_part", "target_clock_period_ns", "estimated_clock_ns",
@@ -40,6 +40,26 @@ class AnalysisRun:
     id: str
     code_project_id: int
     application: str
+
+
+def build_evaluation_context_key(
+    source_text: str,
+    top_function: str,
+    target_part: str,
+    clock_period_ns: float,
+    testbench_signature: str,
+) -> str:
+    """Identify results that are directly comparable across exploration batches."""
+
+    payload = {
+        "source_hash": hashlib.sha256(source_text.encode("utf-8")).hexdigest(),
+        "top_function": top_function,
+        "target_part": target_part.lower(),
+        "clock_period_ns": float(clock_period_ns),
+        "testbench_signature": testbench_signature,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 class ForgeDatabase:
@@ -62,6 +82,7 @@ class ForgeDatabase:
         application: str,
         top_function: str,
         static_report_path: str | None,
+        evaluation_context_key: str = "",
     ) -> AnalysisRun:
         _history_table(application)
         source_hash = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
@@ -81,10 +102,10 @@ class ForgeDatabase:
         self.connection.execute(
             """
             INSERT INTO analysis_runs
-                (id, code_project_id, application, top_function, static_report_path, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (id, code_project_id, application, top_function, static_report_path, evaluation_context_key, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (run_id, project_id, application, top_function, static_report_path, now),
+            (run_id, project_id, application, top_function, static_report_path, evaluation_context_key, now),
         )
         self.connection.commit()
         return AnalysisRun(run_id, project_id, application)
@@ -191,6 +212,7 @@ class ForgeDatabase:
         application: str,
         source_path: str | Path | None = None,
         source_text: str | None = None,
+        evaluation_context_key: str | None = None,
         limit: int = 20,
     ) -> dict[str, Any]:
         table = _history_table(application)
@@ -212,28 +234,61 @@ class ForgeDatabase:
         if source_path is not None and source_text is not None:
             source_hash = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
             current_source_group = _source_group(str(source_path), source_hash)
+        if evaluation_context_key or current_source_group:
+            context_column = "evaluation_context_key" if evaluation_context_key else "source_group"
+            context_value = evaluation_context_key or current_source_group
             current_source_plans = [
                 {
                     "name": row["design_point"],
                     "status": row["experiment_status"],
                     "pragmas": _pragmas_from_plan(row["pragma_plan_json"]),
                     "rationale": row["rationale"],
+                    "runtime_ns": _to_nano_units(row["runtime_s"]),
+                    "power_w": row["power_w"],
+                    "energy_nj": _to_nano_units(row["energy_j"]),
+                    "lut": row["lut"],
+                    "efficiency_score": row["efficiency_score"],
                 }
                 for row in self.connection.execute(
                     f"""
-                    SELECT design_point, experiment_status, pragma_plan_json, rationale
+                    SELECT design_point, experiment_status, pragma_plan_json, rationale,
+                           runtime_s, power_w, energy_j, lut, efficiency_score
                     FROM {table}
-                    WHERE source_group = ? AND role != 'baseline'
+                    WHERE {context_column} = ? AND role != 'baseline'
                     ORDER BY imported_at DESC
                     LIMIT 100
                     """,
-                    (current_source_group,),
+                    (context_value,),
                 ).fetchall()
             ]
+        baseline_scores = [
+            row["efficiency_score"]
+            for row in self.connection.execute(
+                f"""
+                SELECT efficiency_score FROM {table}
+                WHERE {"evaluation_context_key" if evaluation_context_key else "source_group"} = ?
+                  AND role = 'baseline' AND experiment_status = 'completed'
+                ORDER BY imported_at DESC LIMIT 1
+                """,
+                (evaluation_context_key or current_source_group,),
+            ).fetchall()
+        ] if (evaluation_context_key or current_source_group) else []
+        completed_candidate_scores = [
+            item["efficiency_score"]
+            for item in current_source_plans
+            if item["status"] == "completed" and item["efficiency_score"] is not None
+        ]
         return {
             "application": application,
             "current_source_group": current_source_group,
+            "evaluation_context_key": evaluation_context_key,
             "current_source_plans": current_source_plans,
+            "current_context_summary": {
+                "baseline_score": baseline_scores[0] if baseline_scores else None,
+                "best_candidate_score": max(completed_candidate_scores, default=None),
+                "all_completed_candidates_below_baseline": bool(baseline_scores and completed_candidate_scores)
+                and all(score < baseline_scores[0] for score in completed_candidate_scores),
+            },
             "completed_experiments": [
                 {
                     "source_type": row["source_type"],
@@ -301,6 +356,8 @@ class ForgeDatabase:
                 application TEXT NOT NULL,
                 top_function TEXT NOT NULL,
                 static_report_path TEXT,
+                evaluation_context_key TEXT,
+                batch_number INTEGER,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS design_points (
@@ -346,6 +403,7 @@ class ForgeDatabase:
                 CREATE TABLE IF NOT EXISTS {table} (
                     source_type TEXT NOT NULL DEFAULT '{INITIAL_VALIDATED_SOURCE}',
                     source_group TEXT NOT NULL,
+                    evaluation_context_key TEXT,
                     experiment_set TEXT NOT NULL,
                     design_order INTEGER NOT NULL,
                     design_point TEXT NOT NULL,
@@ -415,9 +473,47 @@ class ForgeDatabase:
             "target_clock_period_ns",
             "REAL",
         )
+        _ensure_column(self.connection, "analysis_runs", "evaluation_context_key", "TEXT")
+        _ensure_column(self.connection, "analysis_runs", "batch_number", "INTEGER")
+        for table in APPLICATION_TABLES.values():
+            _ensure_column(self.connection, table, "evaluation_context_key", "TEXT")
         self._backfill_history_metadata()
         self._backfill_missing_forge_history()
         self.connection.commit()
+
+    def reserve_generated_batch(self, run_id: str) -> int:
+        """Assign the next source-level batch number when a run creates projects."""
+
+        run = self.connection.execute(
+            """
+            SELECT ar.batch_number, cp.source_path
+            FROM analysis_runs ar
+            JOIN code_projects cp ON cp.id = ar.code_project_id
+            WHERE ar.id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        if run is None:
+            raise ValueError(f"Analysis run was not found: {run_id}")
+        if run["batch_number"] is not None:
+            return int(run["batch_number"])
+
+        previous = self.connection.execute(
+            """
+            SELECT COALESCE(MAX(ar.batch_number), 0) AS last_batch
+            FROM analysis_runs ar
+            JOIN code_projects cp ON cp.id = ar.code_project_id
+            WHERE cp.source_path = ? AND ar.batch_number IS NOT NULL
+            """,
+            (run["source_path"],),
+        ).fetchone()
+        batch_number = int(previous["last_batch"]) + 1
+        self.connection.execute(
+            "UPDATE analysis_runs SET batch_number = ? WHERE id = ?",
+            (batch_number, run_id),
+        )
+        self.connection.commit()
+        return batch_number
 
     def _backfill_history_metadata(self) -> None:
         """Upgrade earlier local records using their generated project metadata when available."""
@@ -452,7 +548,7 @@ class ForgeDatabase:
             rows = self.connection.execute(
                 f"""
                 SELECT rowid, source_type, source_dir, source_code, experiment_set,
-                       run_dir, pragma_plan_json, rationale, raw_experiment_json
+                       run_dir, pragma_plan_json, rationale, evaluation_context_key, raw_experiment_json
                 FROM {table}
                 """
             ).fetchall()
@@ -468,6 +564,10 @@ class ForgeDatabase:
                 )
                 status = str(raw.get("status") or "completed")
                 config = _generated_project_configuration(row["run_dir"])
+                evaluation_context_key = row["evaluation_context_key"] or _legacy_evaluation_context_key(
+                    row["source_code"] or row["source_dir"],
+                    config,
+                )
                 solution = config.get("solution") if isinstance(config.get("solution"), dict) else {}
                 solution_rationale = _solution_rationale(solution)
                 pragma_plan_json = row["pragma_plan_json"]
@@ -484,6 +584,7 @@ class ForgeDatabase:
                         experiment_status = ?,
                         target_part = CASE WHEN ? IS NOT NULL THEN ? ELSE target_part END,
                         target_clock_period_ns = CASE WHEN ? IS NOT NULL THEN ? ELSE target_clock_period_ns END,
+                        evaluation_context_key = ?,
                         rationale = COALESCE(rationale, ?),
                         pragma_plan_json = ?
                     WHERE rowid = ?
@@ -495,6 +596,7 @@ class ForgeDatabase:
                         config.get("part") if config else None,
                         config.get("clock_period_ns") if config else None,
                         config.get("clock_period_ns") if config else None,
+                        evaluation_context_key,
                         solution_rationale,
                         pragma_plan_json,
                         row["rowid"],
@@ -507,7 +609,7 @@ class ForgeDatabase:
         rows = self.connection.execute(
             """
             SELECT er.design_point_id, er.status, er.metrics_json, ar.application,
-                   ar.id AS analysis_run_id, dp.name
+                   ar.id AS analysis_run_id, ar.batch_number, dp.name
             FROM experiment_results er
             JOIN design_points dp ON dp.id = er.design_point_id
             JOIN analysis_runs ar ON ar.id = dp.analysis_run_id
@@ -520,7 +622,12 @@ class ForgeDatabase:
                 SELECT 1 FROM {table}
                 WHERE experiment_set = ? AND design_point = ?
                 """,
-                (f"forge_run_{row['analysis_run_id']}", row["name"]),
+                (
+                    _forge_experiment_set(
+                        row["analysis_run_id"], row["batch_number"]
+                    ),
+                    row["name"],
+                ),
             ).fetchone()
             if exists is None:
                 self._append_forge_history(
@@ -537,7 +644,8 @@ class ForgeDatabase:
     ) -> None:
         row = self.connection.execute(
             """
-            SELECT ar.application, ar.id AS analysis_run_id, cp.source_path, cp.source_hash,
+            SELECT ar.application, ar.id AS analysis_run_id, ar.evaluation_context_key, ar.batch_number,
+                   cp.source_path, cp.source_hash,
                    cp.source_text, dp.point_key, dp.rank, dp.name, dp.kind, dp.pragmas_json,
                    dp.project_path, dp.strategy, dp.rationale, dp.target_part, dp.target_clock_period_ns
             FROM design_points dp
@@ -554,7 +662,10 @@ class ForgeDatabase:
         record = {
             "source_type": FORGE_RUN_SOURCE,
             "source_group": _source_group(row["source_path"], row["source_hash"]),
-            "experiment_set": f"forge_run_{row['analysis_run_id']}",
+            "evaluation_context_key": row["evaluation_context_key"],
+            "experiment_set": _forge_experiment_set(
+                row["analysis_run_id"], row["batch_number"]
+            ),
             "design_order": 0 if row["rank"] is None else int(row["rank"]),
             "design_point": row["name"],
             "role": row["kind"],
@@ -601,9 +712,11 @@ class ForgeDatabase:
             "metadata_json": json.dumps(
                 {
                     "analysis_run_id": row["analysis_run_id"],
+                    "batch_number": row["batch_number"],
                     "design_point_key": row["point_key"],
                     "source_type": FORGE_RUN_SOURCE,
                     "source_group": _source_group(row["source_path"], row["source_hash"]),
+                    "evaluation_context_key": row["evaluation_context_key"],
                     "experiment_status": status,
                     "latency_source": metrics.get("latency_source"),
                     "cosim_latency_cycles": metrics.get("cosim_latency_cycles"),
@@ -643,6 +756,12 @@ def _normalise_imported_record(
     return normalised
 
 
+def _forge_experiment_set(run_id: str, batch_number: int | None) -> str:
+    if batch_number is None:
+        return f"forge_run_{run_id}"
+    return f"forge_batch_{int(batch_number):03d}_{run_id}"
+
+
 def _ensure_column(
     connection: sqlite3.Connection,
     table: str,
@@ -667,6 +786,20 @@ def _rename_column_if_present(
 
 def _source_group(source_path: str, source_hash: str) -> str:
     return f"{Path(source_path).stem}:{source_hash[:12]}"
+
+
+def _legacy_evaluation_context_key(source_text: str, metadata: dict[str, Any]) -> str:
+    testbench_signature = (
+        "auto" if metadata.get("testbench_generated") else
+        "custom_legacy" if metadata.get("has_testbench") else "none"
+    )
+    return build_evaluation_context_key(
+        source_text,
+        str(metadata.get("top_function", "")),
+        str(metadata.get("part", "")),
+        float(metadata.get("clock_period_ns") or 0.0),
+        testbench_signature,
+    )
 
 
 def _solution_rationale(solution: dict[str, Any]) -> str | None:

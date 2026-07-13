@@ -131,6 +131,7 @@ python forge.py INPUT [--json FILE] [--verbose]
 | `--ai` | off | Requests energy-LUT design points from OpenAI. |
 | `--generate` | off | Runs AI recommendation and generates baseline plus design-point folders. |
 | `--design-points N` | `3` | Number of AI design points. The baseline is added separately. |
+| `--exploration-mode MODE` | `explore` | `explore` uses new pragma plans for the same code/configuration; `verify` may repeat earlier plans. |
 | `--run-vitis` | off | Runs Vitis HLS and Vivado, ranks results, and packages the best design point. Requires `--generate`. |
 | `--tool-timeout SECONDS` | `forge.toml` (`600`) | Maximum time for each Vitis or Vivado command. A timed-out design point is recorded as failed and the remaining candidates continue. |
 | `--model MODEL` | `forge.toml` | OpenAI model override. |
@@ -209,6 +210,11 @@ When `--run-vitis` is used, each project receives execution logs, HLS reports,
 and a Vivado `power_report.rpt`. FORGE writes the final ranking to the pragma
 report, archives all measurements in the configured database, and creates a ZIP archive
 for the best solution. `data/` is local history and is ignored by Git.
+Each `--generate` run adds a batch prefix to its source-local project folders, for
+example `generated/fir_filter_example/batch01_baseline/` and
+`generated/fir_filter_example/batch01_dp01_<name>/`. Later runs use `batch02`,
+`batch03`, and so on. Generated pragma and experiment reports use the same batch
+number in their filenames.
 `--run-vitis` requires `--testbench` or `--auto-testbench`, so the final run
 includes `csim` and `cosim`.
 When a user supplies `--testbench`, efficiency scoring uses its measured cosim
@@ -256,9 +262,11 @@ Unrecognized code uses a separate generic history group.
 
 FORGE stores every pragma target, directive, and directive-level rationale in
 `pragma_plan_json`, plus the design-point strategy, expected effect, and risk.
-For the same exact source, previously tried non-baseline pragma plans are sent
-to AI as experimental context. FORGE prevents duplicates inside one new batch,
-while allowing an earlier plan to be selected again for verification.
+For the same source, top function, part, clock, and testbench identity, earlier
+plans and measured results form one exploration context. The default `explore`
+mode requests new exact pragma plans in each batch; `verify` permits an earlier
+plan to be run again. Different source code or evaluation configuration starts
+a separate exploration context.
 
 Each application history row includes a stable `source_group` for one exact C
 source, an `experiment_set` for one FORGE run, and `design_order` for baseline

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import shlex
 import sys
 import tomllib
@@ -19,7 +20,7 @@ from ai_recommender import (
 )
 from application_classifier import classify_application
 from analyzer import analyze_functions
-from forge_database import ForgeDatabase
+from forge_database import ForgeDatabase, build_evaluation_context_key
 from models import AnalysisReport, FunctionAnalysis
 from parser import CParserError, parse_c_file
 from report import (
@@ -90,6 +91,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=3,
         help="Number of AI design points. Default: 3; baseline is added separately.",
+    )
+    parser.add_argument(
+        "--exploration-mode",
+        choices=("explore", "verify"),
+        default="explore",
+        help="Use new pragma plans for the same experiment context, or allow historical plan verification.",
     )
     parser.add_argument(
         "--model",
@@ -253,6 +260,13 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
         part = args.part
         clock_period_ns = args.clock
         model = args.model
+        evaluation_context_key = build_evaluation_context_key(
+            source_text,
+            top_function,
+            part,
+            clock_period_ns,
+            _testbench_signature(args),
+        )
         _print_tool_progress(
             f"AI recommendation: contacting OpenAI for {args.design_points} design points"
         )
@@ -267,9 +281,11 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
                 application.key,
                 source_path=args.input,
                 source_text=source_text,
+                evaluation_context_key=evaluation_context_key,
             ),
             retry_callback=_print_ai_retry,
             source_text=source_text,
+            exploration_mode=args.exploration_mode,
         )
     except (AIRecommendationError, ValueError, VitisGenerationError) as exc:
         print(f"AI recommendation error: {exc}", file=sys.stderr)
@@ -290,8 +306,11 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
         application.key,
         top_function,
         str(static_report_path) if static_report_path else None,
+        evaluation_context_key,
     )
-    pragma_report_path = REPORT_DIR / f"{Path(args.input).stem}_pragma_report.json"
+    batch_number = database.reserve_generated_batch(run.id) if args.generate else None
+    report_stem = _batch_report_stem(Path(args.input).stem, batch_number)
+    pragma_report_path = REPORT_DIR / f"{report_stem}_pragma_report.json"
     pragma_report = {
         "project": PROJECT_NAME,
         "source_file": str(Path(args.input)),
@@ -299,7 +318,10 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
         "optimization_objective": "energy_lut_efficiency",
         "application": application.to_dict(),
         "analysis_run_id": run.id,
+        "generation_batch": batch_number,
         "design_point_count": args.design_points,
+        "exploration_mode": args.exploration_mode,
+        "evaluation_context_key": evaluation_context_key,
         "target_part": part,
         "clock_period_ns": clock_period_ns,
         "static_report": str(static_report_path) if static_report_path else None,
@@ -325,6 +347,7 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
                 testbench_path=args.testbench,
                 auto_testbench=args.auto_testbench,
                 include_dirs=args.include_dir,
+                batch_number=batch_number,
             )
         except VitisGenerationError as exc:
             print(f"Vitis generation error: {exc}", file=sys.stderr)
@@ -369,7 +392,7 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
                 experiment_report_paths = write_experiment_reports(
                     [item.to_dict() for item in experiment_results],
                     REPORT_DIR,
-                    Path(args.input).stem,
+                    report_stem,
                 )
                 pragma_report["experiment_results"] = [item.to_dict() for item in experiment_results]
                 pragma_report["experiment_reports"] = experiment_report_paths
@@ -381,7 +404,7 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
             experiment_report_paths = write_experiment_reports(
                 [item.to_dict() for item in experiment_results],
                 REPORT_DIR,
-                Path(args.input).stem,
+                report_stem,
             )
 
     pragma_report["generated_projects"] = [
@@ -403,8 +426,8 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
     _print_tool_progress(f"AI pragma report: written to {pragma_report_path}")
     if generated_projects:
         _print_tool_progress(
-            "Generated projects: written to "
-            f"{Path(args.output_root) / Path(args.input).stem}"
+            f"Generated batch {batch_number:02d}: written to "
+            f"{generated_projects[0].workspace_directory}"
         )
     if best_result:
         _print_tool_progress(
@@ -592,6 +615,12 @@ def _resolve_report_path(json_output: str) -> Path:
     return REPORT_DIR / filename
 
 
+def _batch_report_stem(source_stem: str, batch_number: int | None) -> str:
+    if batch_number is None:
+        return source_stem
+    return f"{source_stem}_batch{batch_number:02d}"
+
+
 def _record_experiment_results(
     database: ForgeDatabase,
     design_point_ids: dict[str, int],
@@ -633,6 +662,13 @@ def _record_experiment_results(
 
 def _normalise_project_path(path: str) -> str:
     return str(Path(path).resolve())
+
+
+def _testbench_signature(args: argparse.Namespace) -> str:
+    if args.testbench:
+        contents = Path(args.testbench).read_bytes()
+        return "custom:" + hashlib.sha256(contents).hexdigest()
+    return "auto" if args.auto_testbench else "none"
 
 
 def _print_tool_progress(message: str) -> None:

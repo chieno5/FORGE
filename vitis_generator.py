@@ -52,6 +52,7 @@ def generate_vitis_projects(
     testbench_path: str | Path | None = None,
     auto_testbench: bool = False,
     include_dirs: list[str | Path] | None = None,
+    batch_number: int | None = None,
 ) -> list[GeneratedProject]:
     source = Path(source_path)
     if not source.exists():
@@ -66,6 +67,8 @@ def generate_vitis_projects(
         raise VitisGenerationError("At least one optimisation solution is required.")
     if testbench_path and auto_testbench:
         raise VitisGenerationError("Use either --testbench or --auto-testbench, not both.")
+    if batch_number is not None and batch_number < 1:
+        raise VitisGenerationError("batch_number must be at least 1 when provided.")
 
     top_analysis = _find_function(report, top_function)
     original_source = source.read_text(encoding="utf-8")
@@ -78,12 +81,13 @@ def generate_vitis_projects(
         auto_testbench=auto_testbench,
     )
     project_root = Path(output_root) / source.stem
+    batch_prefix = f"batch{batch_number:02d}_" if batch_number is not None else ""
     project_root.mkdir(parents=True, exist_ok=True)
     generated: list[GeneratedProject] = []
 
     generated.append(
         _write_project(
-            project_dir=project_root / "baseline",
+            project_dir=project_root / f"{batch_prefix}baseline",
             source=source,
             source_text=_prepare_vitis_source(original_source, report, top_function),
             testbench=testbench,
@@ -99,7 +103,7 @@ def generate_vitis_projects(
     for solution in solutions:
         _validate_solution_safety(original_source, report, solution)
         transformed = _insert_pragmas(original_source, report, solution.pragmas)
-        project_name = f"solution_{solution.rank:02d}_{_slug(solution.name)}"
+        project_name = _project_name(solution, batch_prefix)
         generated.append(
             _write_project(
                 project_dir=project_root / project_name,
@@ -725,3 +729,10 @@ def _build_tcl(
 def _slug(value: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9]+", "_", value.strip().lower()).strip("_")
     return slug[:40] or "solution"
+
+
+def _project_name(solution: OptimizationSolution, batch_prefix: str) -> str:
+    if not batch_prefix:
+        return f"solution_{solution.rank:02d}_{_slug(solution.name)}"
+    suffix = re.sub(r"^dp\d+_?", "", _slug(solution.name))
+    return f"{batch_prefix}dp{solution.rank:02d}_{suffix or 'design'}"
