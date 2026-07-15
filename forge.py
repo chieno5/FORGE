@@ -54,7 +54,7 @@ ASCII_LOGO = """
  ██║     ╚██████╔╝██║  ██║╚██████╔╝███████╗
  ╚═╝      ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚══════╝
 
-              Forge Hardware. Explore Design Space.
+  Forge Hardware. Explore Design Space.
 """
 
 
