@@ -61,6 +61,7 @@ class ExperimentResult:
     package_path: str | None = None
     error: str | None = None
     pragma_validation: dict[str, Any] | None = None
+    hls_schedule: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -75,6 +76,7 @@ def run_experiments(
     amd_root: str | Path | None = None,
     tool_timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
     progress_callback: ProgressCallback | None = None,
+    reuse_hls_directories: Iterable[str | Path] | None = None,
 ) -> list[ExperimentResult]:
     """Run HLS and early RTL power estimation for baseline and all design points."""
 
@@ -86,6 +88,9 @@ def run_experiments(
         amd_root,
     )
     results: list[ExperimentResult] = []
+    reusable = {
+        str(Path(directory).resolve()) for directory in (reuse_hls_directories or [])
+    }
     for project in projects:
         _emit(progress_callback, f"{project.name}: starting Vitis HLS")
         results.append(
@@ -97,6 +102,7 @@ def run_experiments(
                 vivado,
                 tool_timeout_seconds,
                 progress_callback,
+                str(Path(project.directory).resolve()) in reusable,
             )
         )
 
@@ -211,6 +217,77 @@ def parse_csynth_report(path: str | Path) -> dict[str, float | int | None]:
     }
 
 
+def parse_csynth_schedule(path: str | Path) -> dict[str, Any]:
+    """Extract the achieved baseline schedule in a compact AI-facing form."""
+
+    root = ET.parse(path).getroot()
+    metrics = parse_csynth_report(path)
+    loops: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for node in root.findall(".//SummaryOfLoopLatency/*"):
+        name = node.findtext("Name") or node.attrib.get("name") or node.tag
+        performance_pragma = (node.findtext("PerformancePragma") or "").strip()
+        loop = {
+            "name": name,
+            "trip_count": _xml_child_number(node, "TripCount"),
+            "latency_cycles": _xml_child_number(node, "Latency"),
+            "initiation_interval": _xml_child_number(node, "PipelineII"),
+            "pipeline_depth": _xml_child_number(node, "PipelineDepth"),
+            "performance_pragma": (
+                performance_pragma
+                if performance_pragma not in {"", "-", "N/A"}
+                else None
+            ),
+        }
+        signature = tuple(loop.values())
+        if signature not in seen:
+            loops.append(loop)
+            seen.add(signature)
+    return {
+        "latency_cycles": metrics["latency_cycles"],
+        "initiation_interval": metrics["initiation_interval"],
+        "clock_period_ns": metrics["clock_period_ns"],
+        "resources": {
+            "lut": metrics["lut"],
+            "ff": metrics["ff"],
+            "bram": metrics["bram"],
+            "dsp": metrics["dsp"],
+        },
+        "pipeline_type": (root.findtext(".//PerformanceEstimates/PipelineType") or "").strip() or None,
+        "loops": loops[:64],
+    }
+
+
+def run_baseline_preflight(
+    project: Any,
+    vitis_hls_command: str | None = None,
+    amd_root: str | Path | None = None,
+    tool_timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """Synthesize the baseline before recommendation and return its achieved schedule."""
+
+    if tool_timeout_seconds <= 0:
+        raise VitisExecutionError("Tool timeout must be greater than zero.")
+    vitis_hls, _ = resolve_toolchain(vitis_hls_command, None, amd_root)
+    project_dir = Path(project.directory).resolve()
+    workspace_dir = _workspace_directory(project_dir)
+    _emit(progress_callback, f"{project.name}: baseline schedule preflight")
+    _run_command(
+        vitis_hls,
+        vitis_hls.hls_arguments(_workspace_script(project_dir, "run_hls.tcl")),
+        workspace_dir,
+        str(project_dir.relative_to(workspace_dir) / "vitis_hls.log"),
+        tool_timeout_seconds,
+        progress_callback,
+        f"{project.name} | baseline Vitis HLS",
+    )
+    report = _find_one(project_dir, "csynth.xml")
+    if report is None:
+        raise VitisExecutionError("Baseline preflight completed but csynth.xml was not generated.")
+    return parse_csynth_schedule(report)
+
+
 def resolve_toolchain(
     vitis_hls_command: str | None = None,
     vivado_command: str | None = None,
@@ -279,23 +356,29 @@ def _run_one(
     vivado: ToolInvocation,
     tool_timeout_seconds: float,
     progress_callback: ProgressCallback | None,
+    reuse_hls: bool = False,
 ) -> ExperimentResult:
     project_dir = Path(project.directory).resolve()
     workspace_dir = _workspace_directory(project_dir)
     try:
-        _run_command(
-            vitis_hls,
-            vitis_hls.hls_arguments(_workspace_script(project_dir, "run_hls.tcl")),
-            workspace_dir,
-            str(project_dir.relative_to(workspace_dir) / "vitis_hls.log"),
-            tool_timeout_seconds,
-            progress_callback,
-            f"{project.name} | Vitis HLS",
-        )
+        existing_report = _find_one(project_dir, "csynth.xml") if reuse_hls else None
+        if existing_report is None:
+            _run_command(
+                vitis_hls,
+                vitis_hls.hls_arguments(_workspace_script(project_dir, "run_hls.tcl")),
+                workspace_dir,
+                str(project_dir.relative_to(workspace_dir) / "vitis_hls.log"),
+                tool_timeout_seconds,
+                progress_callback,
+                f"{project.name} | Vitis HLS",
+            )
+        else:
+            _emit(progress_callback, f"{project.name}: reusing baseline preflight synthesis")
         hls_report = _find_one(project_dir, "csynth.xml")
         if hls_report is None:
             raise VitisExecutionError("Vitis HLS completed but csynth.xml was not generated.")
         metrics = parse_csynth_report(hls_report)
+        hls_schedule = parse_csynth_schedule(hls_report)
         cosim_report = _find_pattern(project_dir, "*_cosim.rpt")
         cosim_latency, cosim_interval = (
             parse_cosim_report(cosim_report) if cosim_report is not None else (None, None)
@@ -345,6 +428,7 @@ def _run_one(
                 cosim_report=str(cosim_report) if cosim_report else None,
                 error=error,
                 pragma_validation=pragma_validation,
+                hls_schedule=hls_schedule,
             )
         power_tcl = project_dir / "run_power.tcl"
         power_tcl.write_text(
@@ -393,6 +477,7 @@ def _run_one(
             cosim_report=str(cosim_report) if cosim_report else None,
             power_report=str(power_report),
             pragma_validation=pragma_validation,
+            hls_schedule=hls_schedule,
         )
     except VitisExecutionError as exc:
         _emit(progress_callback, f"{project.name}: failed - {exc}")
@@ -727,6 +812,16 @@ def _xml_number(root: ET.Element, path: str) -> float | None:
 def _xml_int(root: ET.Element, path: str) -> int | None:
     number = _xml_number(root, path)
     return int(number) if number is not None else None
+
+
+def _xml_child_number(node: ET.Element, name: str) -> float | None:
+    child = node.find(name)
+    if child is None or child.text is None:
+        return None
+    try:
+        return float(child.text.strip())
+    except ValueError:
+        return None
 
 
 def _as_float(value: float | int | None) -> float | None:

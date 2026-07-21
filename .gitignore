@@ -6,4 +6,3 @@ generated/
 data/
 .env
 forge.toml
-tests/

@@ -26,15 +26,16 @@ from parser import CParserError, parse_c_file
 from report import (
     print_human_report,
     write_data_report,
-    write_experiment_reports,
     write_json_report,
 )
 from scorer import score_report
 from vitis_generator import VitisGenerationError, generate_vitis_projects
 from vitis_runner import (
     DEFAULT_TOOL_TIMEOUT_SECONDS,
+    ExperimentResult,
     VitisExecutionError,
     package_best_project,
+    run_baseline_preflight,
     run_experiments,
     select_best_result,
 )
@@ -255,6 +256,8 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
     source_text = Path(args.input).read_text(encoding="utf-8")
     application = classify_application(args.input, source_text, analysis_report)
     database = ForgeDatabase(args.database)
+    baseline_preflight_project = None
+    baseline_schedule = None
     try:
         top_function = _select_top_function(functions, args.top)
         part = args.part
@@ -267,6 +270,53 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
             clock_period_ns,
             _testbench_signature(args),
         )
+        run = database.create_run(
+            source_text,
+            application.key,
+            top_function,
+            evaluation_context_key,
+        )
+        batch_number = database.reserve_generated_batch(run.id) if args.generate else None
+        experience_context = database.history_context(
+            application.key,
+            source_text=source_text,
+            evaluation_context_key=evaluation_context_key,
+        )
+        if args.generate and args.run_vitis:
+            _print_tool_progress(
+                "Baseline preflight: synthesizing the unmodified source before AI recommendation"
+            )
+            baseline_preflight_project = generate_vitis_projects(
+                source_path=args.input,
+                report=analysis_report,
+                solutions=[],
+                top_function=top_function,
+                output_root=args.output_root,
+                part=part,
+                clock_period_ns=clock_period_ns,
+                testbench_path=args.testbench,
+                auto_testbench=args.auto_testbench,
+                include_dirs=args.include_dir,
+                batch_number=batch_number,
+            )[0]
+            baseline_schedule = run_baseline_preflight(
+                baseline_preflight_project,
+                vitis_hls_command=args.vitis_hls,
+                amd_root=args.amd_root,
+                tool_timeout_seconds=args.tool_timeout,
+                progress_callback=_print_tool_progress,
+            )
+            experience_context["baseline_schedule"] = baseline_schedule
+            _print_tool_progress(
+                "Baseline preflight: achieved schedule added to the AI context"
+            )
+        state = experience_context.get("exploration_state", {})
+        if args.exploration_mode == "explore" and state.get("converged"):
+            _print_tool_progress(
+                "Exploration state: design space is converged after "
+                f"{state.get('stagnant_batches', 0)} stagnant batches; "
+                "only bounded refinement or verification will be requested"
+            )
         _print_tool_progress(
             f"AI recommendation: contacting OpenAI for {args.design_points} design points"
         )
@@ -277,17 +327,17 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
             clock_period_ns=clock_period_ns,
             design_point_count=args.design_points,
             model=model,
-            experience_context=database.history_context(
-                application.key,
-                source_path=args.input,
-                source_text=source_text,
-                evaluation_context_key=evaluation_context_key,
-            ),
+            experience_context=experience_context,
             retry_callback=_print_ai_retry,
             source_text=source_text,
             exploration_mode=args.exploration_mode,
         )
+    except VitisExecutionError as exc:
+        database.close()
+        print(f"Baseline preflight error: {exc}", file=sys.stderr)
+        return 5
     except (AIRecommendationError, ValueError, VitisGenerationError) as exc:
+        database.close()
         print(f"AI recommendation error: {exc}", file=sys.stderr)
         return 3
 
@@ -295,20 +345,28 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
         f"AI recommendation: received {len(ai_result.solutions)} design points"
     )
     if ai_result.fallback_reason:
+        fallback_count = sum("local_safe" in item.name for item in ai_result.solutions)
+        if 0 < fallback_count < len(ai_result.solutions):
+            _print_tool_progress(
+                "AI recommendation: retained "
+                f"{len(ai_result.solutions) - fallback_count} validated AI design point(s) "
+                f"and used local safe fallback for {fallback_count} unrepaired point(s)"
+            )
+        else:
+            _print_tool_progress(
+                "AI recommendation: using local safe fallback after invalid AI responses"
+            )
         _print_tool_progress(
-            "AI recommendation: using local safe fallback after invalid AI responses"
+            "Recommendation set: accepted; "
+            f"{len(ai_result.solutions)} design points passed FORGE pre-generation validation"
+        )
+    else:
+        _print_tool_progress(
+            "AI recommendation: accepted; "
+            f"{len(ai_result.solutions)} design points passed FORGE pre-generation validation"
         )
     _print_ai_summary(ai_result.summary, ai_result.solutions)
 
-    run = database.create_run(
-        args.input,
-        source_text,
-        application.key,
-        top_function,
-        str(static_report_path) if static_report_path else None,
-        evaluation_context_key,
-    )
-    batch_number = database.reserve_generated_batch(run.id) if args.generate else None
     report_stem = _batch_report_stem(Path(args.input).stem, batch_number)
     pragma_report_path = REPORT_DIR / f"{report_stem}_pragma_report.json"
     pragma_report = {
@@ -319,11 +377,14 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
         "application": application.to_dict(),
         "analysis_run_id": run.id,
         "generation_batch": batch_number,
-        "design_point_count": args.design_points,
+        "requested_design_point_count": args.design_points,
+        "design_point_count": len(ai_result.solutions),
         "exploration_mode": args.exploration_mode,
         "evaluation_context_key": evaluation_context_key,
         "target_part": part,
         "clock_period_ns": clock_period_ns,
+        "baseline_schedule": baseline_schedule or experience_context.get("baseline_schedule"),
+        "exploration_state": experience_context.get("exploration_state"),
         "static_report": str(static_report_path) if static_report_path else None,
         "ai": ai_result.to_dict(),
         "generated_projects": [],
@@ -333,7 +394,8 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
     generated_projects = []
     experiment_results = []
     best_result = None
-    experiment_report_paths = {}
+    batch_best_result = None
+    selection_source = None
     if args.generate:
         try:
             generated_projects = generate_vitis_projects(
@@ -350,6 +412,7 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
                 batch_number=batch_number,
             )
         except VitisGenerationError as exc:
+            database.close()
             print(f"Vitis generation error: {exc}", file=sys.stderr)
             return 4
 
@@ -365,54 +428,77 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
                     part,
                     vitis_hls_command=args.vitis_hls,
                     vivado_command=args.vivado,
-                amd_root=args.amd_root,
-                tool_timeout_seconds=args.tool_timeout,
-                progress_callback=_print_tool_progress,
-            )
+                    amd_root=args.amd_root,
+                    tool_timeout_seconds=args.tool_timeout,
+                    progress_callback=_print_tool_progress,
+                    reuse_hls_directories=(
+                        [baseline_preflight_project.directory]
+                        if baseline_preflight_project is not None else None
+                    ),
+                )
             except VitisExecutionError as exc:
                 print(f"Vitis execution error: {exc}", file=sys.stderr)
                 pragma_report["execution_error"] = str(exc)
                 write_data_report(pragma_report, pragma_report_path)
+                database.close()
                 return 5
+            _record_experiment_results(
+                database, design_point_ids, generated_projects, experiment_results
+            )
+            _print_vitis_validation_summary(experiment_results)
             try:
+                batch_best_result = select_best_result(experiment_results)
+                best_result, selection_source = _choose_overall_best(
+                    batch_best_result, experience_context.get("incumbent_best")
+                )
+                if selection_source == "historical_overall_best":
+                    _print_tool_progress(
+                        "Current batch did not exceed the historical incumbent; "
+                        f"using overall best {best_result.name} "
+                        f"(efficiency_score={best_result.efficiency_score:.4f})"
+                    )
                 best_result = package_best_project(
-                    select_best_result(experiment_results),
+                    best_result,
                     top_function,
                     vitis_hls_command=args.vitis_hls,
                     amd_root=args.amd_root,
                     tool_timeout_seconds=args.tool_timeout,
                     progress_callback=_print_tool_progress,
                 )
-                experiment_results = [
-                    best_result if item.project_directory == best_result.project_directory else item
-                    for item in experiment_results
-                ]
+                if selection_source == "current_batch":
+                    experiment_results = [
+                        best_result
+                        if item.project_directory == best_result.project_directory else item
+                        for item in experiment_results
+                    ]
+                    _record_experiment_results(
+                        database, design_point_ids, generated_projects, experiment_results
+                    )
+                else:
+                    historical_id = experience_context["incumbent_best"].get("id")
+                    if historical_id is not None:
+                        database.record_experiment(
+                            int(historical_id), best_result.to_dict(), best_result.status
+                        )
             except VitisExecutionError as exc:
-                _record_experiment_results(database, design_point_ids, generated_projects, experiment_results)
-                experiment_report_paths = write_experiment_reports(
-                    [item.to_dict() for item in experiment_results],
-                    REPORT_DIR,
-                    report_stem,
+                pragma_report["batch_evaluation"] = _batch_evaluation_summary(
+                    experiment_results
                 )
-                pragma_report["experiment_results"] = [item.to_dict() for item in experiment_results]
-                pragma_report["experiment_reports"] = experiment_report_paths
                 pragma_report["execution_error"] = str(exc)
                 write_data_report(pragma_report, pragma_report_path)
                 print(f"Vitis execution error: {exc}", file=sys.stderr)
+                database.close()
                 return 5
-            _record_experiment_results(database, design_point_ids, generated_projects, experiment_results)
-            experiment_report_paths = write_experiment_reports(
-                [item.to_dict() for item in experiment_results],
-                REPORT_DIR,
-                report_stem,
-            )
 
     pragma_report["generated_projects"] = [
         item.to_dict() for item in generated_projects
     ]
-    pragma_report["experiment_results"] = [item.to_dict() for item in experiment_results]
+    pragma_report["batch_evaluation"] = _batch_evaluation_summary(experiment_results)
+    pragma_report["batch_best_design_point"] = (
+        batch_best_result.to_dict() if batch_best_result else None
+    )
     pragma_report["best_design_point"] = best_result.to_dict() if best_result else None
-    pragma_report["experiment_reports"] = experiment_report_paths
+    pragma_report["selection_source"] = selection_source
     write_data_report(pragma_report, pragma_report_path)
 
     _print_tool_progress(f"Selected top function: {top_function}")
@@ -435,7 +521,6 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
             f"efficiency_score={best_result.efficiency_score:.4f}"
         )
         _print_tool_progress(f"Final package: {best_result.package_path}")
-        _print_tool_progress(f"Experiment reports: {experiment_report_paths}")
     database.close()
     return 0
 
@@ -647,17 +732,74 @@ def _record_experiment_results(
             design_point_ids[point_key],
             result.to_dict(),
             result.status,
-            {
-                key: value
-                for key, value in {
-                    "hls_report": result.hls_report,
-                    "cosim_report": result.cosim_report,
-                    "power_report": result.power_report,
-                    "package": result.package_path,
-                }.items()
-                if value
-            },
         )
+
+
+def _historical_experiment_result(record: dict[str, Any] | None) -> ExperimentResult | None:
+    if not record or not record.get("project_path"):
+        return None
+    project_path = Path(str(record["project_path"]))
+    if not project_path.is_dir():
+        return None
+    metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+
+    def value(name: str, default: Any = None) -> Any:
+        candidate = metrics.get(name)
+        return record.get(name, default) if candidate is None else candidate
+
+    return ExperimentResult(
+        name=str(record.get("name") or project_path.name),
+        kind=str(record.get("kind") or "solution"),
+        project_directory=str(project_path),
+        status="completed",
+        latency_cycles=value("latency_cycles"),
+        initiation_interval=value("initiation_interval"),
+        clock_period_ns=value("clock_period_ns"),
+        runtime_ns=value("runtime_ns"),
+        performance=value("performance"),
+        lut=value("lut"),
+        ff=value("ff"),
+        bram=value("bram"),
+        dsp=value("dsp"),
+        power_w=value("power_w"),
+        energy_nj=value("energy_nj"),
+        latency_source=value("latency_source"),
+        hls_latency_cycles=value("hls_latency_cycles"),
+        cosim_latency_cycles=value("cosim_latency_cycles"),
+        efficiency_score=value("efficiency_score"),
+        performance_norm=value("performance_norm"),
+        power_norm=value("power_norm"),
+        energy_norm=value("energy_norm"),
+        lut_norm=value("lut_norm"),
+        hls_report=value("hls_report"),
+        cosim_report=value("cosim_report"),
+        power_report=value("power_report"),
+        package_path=value("package_path"),
+        error=value("error"),
+        pragma_validation=value("pragma_validation"),
+        hls_schedule=value("hls_schedule"),
+    )
+
+
+def _batch_evaluation_summary(results: list[ExperimentResult]) -> dict[str, Any]:
+    statuses: dict[str, int] = {}
+    for result in results:
+        statuses[result.status] = statuses.get(result.status, 0) + 1
+    return {"design_points": len(results), "status_counts": statuses}
+
+
+def _choose_overall_best(
+    batch_best: ExperimentResult,
+    historical_record: dict[str, Any] | None,
+) -> tuple[ExperimentResult, str]:
+    historical = _historical_experiment_result(historical_record)
+    if historical is None:
+        return batch_best, "current_batch"
+    if (historical.efficiency_score or float("-inf")) > (
+        batch_best.efficiency_score or float("-inf")
+    ):
+        return historical, "historical_overall_best"
+    return batch_best, "current_batch"
 
 
 def _normalise_project_path(path: str) -> str:
@@ -686,14 +828,40 @@ def _configure_console_encoding() -> None:
 def _print_ai_summary(summary: str, solutions: list[object]) -> None:
     compact_summary = " ".join(summary.split())
     if compact_summary:
-        print(f"[FORGE] AI summary: {compact_summary}")
+        print(f"[FORGE] AI summary: {_short_console_text(compact_summary)}")
     names = ", ".join(f"{item.rank}. {item.name}" for item in solutions)
     if names:
         print(f"[FORGE] AI design points: {names}")
 
 
+def _short_console_text(value: str, limit: int = 240) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: limit - 3].rstrip() + "..."
+
+
 def _print_ai_retry(attempt: int, error: str) -> None:
-    print(f"[FORGE] AI recommendation: retry {attempt}/3 - {error}")
+    action = "targeted refine" if error.startswith("Targeted repair") else "retry"
+    print(f"[FORGE] AI recommendation: {action} {attempt}/3 - {error}")
+
+
+def _print_vitis_validation_summary(results: list[ExperimentResult]) -> None:
+    candidates = [item for item in results if item.kind != "baseline"]
+    if not candidates:
+        return
+    passed = sum(item.status == "completed" for item in candidates)
+    rejected = len(candidates) - passed
+    if rejected == 0:
+        _print_tool_progress(
+            "Recommendation evaluation: all "
+            f"{passed} design points passed Vitis validation"
+        )
+        return
+    _print_tool_progress(
+        "Recommendation evaluation: "
+        f"{passed}/{len(candidates)} design points passed Vitis validation; "
+        f"{rejected} invalid/failed"
+    )
 
 
 if __name__ == "__main__":

@@ -17,29 +17,22 @@ APPLICATION_TABLES = {
     "reduction_dot": "history_reduction_dot",
     "conv2d_3x3": "history_conv2d_3x3",
 }
+SUPPORTED_APPLICATIONS = frozenset((*APPLICATION_TABLES, "unclassified"))
 
 INITIAL_VALIDATED_SOURCE = "initial_validated"
 FORGE_RUN_SOURCE = "forge_run"
-
-HISTORY_COLUMNS = [
-    "source_type", "source_group", "evaluation_context_key", "experiment_set", "design_order", "design_point", "role",
-    "experiment_status", "source_dir",
-    "source_code", "pragma_plan_json", "rationale", "run_dir", "report_dir",
-    "target_part", "target_clock_period_ns", "estimated_clock_ns",
-    "hls_latency_cycles", "hls_interval_cycles", "primary_loop", "loop_ii",
-    "loop_latency_cycles", "bram_18k", "dsp", "ff", "lut", "uram", "power_w",
-    "dynamic_w", "static_w", "power_confidence", "power_source", "runtime_s",
-    "performance_1_per_s", "performance_norm", "power_norm", "energy_j",
-    "energy_norm", "lut_norm", "efficiency_score", "csynth_xml", "power_report",
-    "raw_experiment_json", "raw_metrics_json", "metadata_json", "imported_at",
-]
+UNIFIED_SCHEMA_VERSION = 2
 
 
-@dataclass(frozen=True)
+@dataclass
 class AnalysisRun:
     id: str
-    code_project_id: int
     application: str
+    original_source_code: str
+    original_source_hash: str
+    top_function: str
+    evaluation_context_key: str
+    batch_number: int | None = None
 
 
 def build_evaluation_context_key(
@@ -63,13 +56,14 @@ def build_evaluation_context_key(
 
 
 class ForgeDatabase:
-    """Local SQLite store with one completed-experiment table per application."""
+    """SQLite experiment store with one row per design point."""
 
     def __init__(self, path: str | Path = "data/forge.db") -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
+        self._runs: dict[str, AnalysisRun] = {}
         self._create_schema()
 
     def close(self) -> None:
@@ -77,69 +71,103 @@ class ForgeDatabase:
 
     def create_run(
         self,
-        source_path: str | Path,
         source_text: str,
         application: str,
         top_function: str,
-        static_report_path: str | None,
         evaluation_context_key: str = "",
     ) -> AnalysisRun:
-        _history_table(application)
-        source_hash = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
-        now = _now()
-        self.connection.execute(
-            """
-            INSERT INTO code_projects (source_path, source_hash, source_text, created_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(source_hash) DO UPDATE SET source_path = excluded.source_path
-            """,
-            (str(source_path), source_hash, source_text, now),
+        _validate_application(application)
+        run = AnalysisRun(
+            id=uuid.uuid4().hex,
+            application=application,
+            original_source_code=source_text,
+            original_source_hash=hashlib.sha256(source_text.encode("utf-8")).hexdigest(),
+            top_function=top_function,
+            evaluation_context_key=evaluation_context_key,
         )
-        project_id = self.connection.execute(
-            "SELECT id FROM code_projects WHERE source_hash = ?", (source_hash,)
-        ).fetchone()["id"]
-        run_id = uuid.uuid4().hex
-        self.connection.execute(
-            """
-            INSERT INTO analysis_runs
-                (id, code_project_id, application, top_function, static_report_path, evaluation_context_key, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (run_id, project_id, application, top_function, static_report_path, evaluation_context_key, now),
-        )
-        self.connection.commit()
-        return AnalysisRun(run_id, project_id, application)
+        self._runs[run.id] = run
+        return run
+
+    def reserve_generated_batch(self, run_id: str) -> int:
+        run = self._run(run_id)
+        if run.batch_number is not None:
+            return run.batch_number
+        if run.evaluation_context_key:
+            row = self.connection.execute(
+                "SELECT COALESCE(MAX(batch_number), 0) FROM experiments "
+                "WHERE evaluation_context_key = ?",
+                (run.evaluation_context_key,),
+            ).fetchone()
+        else:
+            row = self.connection.execute(
+                "SELECT COALESCE(MAX(batch_number), 0) FROM experiments "
+                "WHERE original_source_hash = ? AND application = ?",
+                (run.original_source_hash, run.application),
+            ).fetchone()
+        reserved = [
+            item.batch_number
+            for item in self._runs.values()
+            if item.id != run.id
+            and item.batch_number is not None
+            and item.application == run.application
+            and (
+                item.evaluation_context_key == run.evaluation_context_key
+                if run.evaluation_context_key
+                else item.original_source_hash == run.original_source_hash
+            )
+        ]
+        run.batch_number = max([int(row[0]), *reserved], default=0) + 1
+        return run.batch_number
 
     def record_design_points(
         self,
         run_id: str,
         projects: list[dict[str, Any]],
     ) -> dict[str, int]:
+        run = self._run(run_id)
+        experiment_set = _forge_experiment_set(run.id, run.batch_number)
         ids: dict[str, int] = {}
         for project in projects:
+            point_key = _point_key(project)
+            generated_source = _read_optional_text(project.get("source_file"))
+            plan = {
+                "strategy": project.get("strategy"),
+                "rationale": project.get("rationale"),
+                "pragmas": project.get("pragmas", []),
+            }
             cursor = self.connection.execute(
                 """
-                INSERT INTO design_points
-                    (analysis_run_id, point_key, rank, name, kind, pragmas_json, project_path,
-                     strategy, rationale, target_part, target_clock_period_ns, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO experiments (
+                    source_type, application, evaluation_context_key, experiment_set,
+                    batch_number, design_order, design_point, role, status,
+                    original_source_hash, original_source_code, generated_source_code,
+                    top_function, pragma_plan_json, rationale, target_part,
+                    target_clock_period_ns, project_path, metrics_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?)
                 """,
                 (
-                    run_id,
-                    _point_key(project),
-                    project.get("rank"),
+                    FORGE_RUN_SOURCE,
+                    run.application,
+                    run.evaluation_context_key,
+                    experiment_set,
+                    run.batch_number,
+                    int(project.get("rank") or 0),
                     project["name"],
                     project["kind"],
-                    json.dumps(project.get("pragmas", []), ensure_ascii=False),
-                    project["directory"],
-                    project.get("strategy"),
+                    run.original_source_hash,
+                    run.original_source_code,
+                    generated_source or run.original_source_code,
+                    run.top_function,
+                    json.dumps(plan, ensure_ascii=False),
                     project.get("rationale"),
                     project.get("target_part"),
                     project.get("target_clock_period_ns"),
+                    project.get("directory"),
+                    _now(),
                     _now(),
                 ),
             )
-            ids[_point_key(project)] = int(cursor.lastrowid)
+            ids[point_key] = int(cursor.lastrowid)
         self.connection.commit()
         return ids
 
@@ -148,17 +176,16 @@ class ForgeDatabase:
         design_point_id: int,
         metrics: dict[str, Any],
         status: str,
-        artifact_paths: dict[str, str] | None = None,
     ) -> None:
-        self.connection.execute(
+        cursor = self.connection.execute(
             """
-            INSERT INTO experiment_results
-                (design_point_id, status, metrics_json, runtime_ns, performance, power_w,
-                 energy_nj, lut, efficiency_score, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            UPDATE experiments
+            SET status = ?, metrics_json = ?, runtime_ns = ?, performance = ?,
+                power_w = ?, energy_nj = ?, lut = ?, efficiency_score = ?,
+                error = ?, updated_at = ?
+            WHERE id = ?
             """,
             (
-                design_point_id,
                 status,
                 json.dumps(metrics, ensure_ascii=False),
                 metrics.get("runtime_ns"),
@@ -167,149 +194,148 @@ class ForgeDatabase:
                 metrics.get("energy_nj"),
                 metrics.get("lut"),
                 metrics.get("efficiency_score"),
+                metrics.get("error"),
                 _now(),
+                design_point_id,
             ),
         )
-        self._append_forge_history(design_point_id, metrics, status)
-        for kind, path in (artifact_paths or {}).items():
-            self.connection.execute(
-                """
-                INSERT INTO artifacts (design_point_id, kind, path, created_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (design_point_id, kind, path, _now()),
-            )
+        if cursor.rowcount == 0:
+            raise ValueError(f"Design point was not found: {design_point_id}")
         self.connection.commit()
-
-    def record_diagnostic_failure(
-        self,
-        run_id: str,
-        point_key: str,
-        message: str,
-        artifact_paths: dict[str, str] | None = None,
-    ) -> None:
-        """Store a manually diagnosed interrupted experiment against its design point."""
-
-        row = self.connection.execute(
-            """
-            SELECT id FROM design_points
-            WHERE analysis_run_id = ? AND point_key = ?
-            ORDER BY id DESC LIMIT 1
-            """,
-            (run_id, point_key),
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"Design point was not found: {run_id}/{point_key}")
-        self.record_experiment(
-            int(row["id"]),
-            {"status": "failed", "error": message, "diagnostic": True},
-            "failed",
-            artifact_paths,
-        )
 
     def history_context(
         self,
         application: str,
-        source_path: str | Path | None = None,
         source_text: str | None = None,
         evaluation_context_key: str | None = None,
         limit: int = 20,
     ) -> dict[str, Any]:
-        table = _history_table(application)
+        _validate_application(application)
         rows = self.connection.execute(
-            f"""
-            SELECT source_type, source_group, experiment_set, design_order, design_point, role,
-                   experiment_status, pragma_plan_json, rationale,
-                   runtime_s, performance_1_per_s, power_w, energy_j, lut, efficiency_score
-            FROM {table}
-            WHERE experiment_status = 'completed'
-              AND efficiency_score IS NOT NULL
-            ORDER BY efficiency_score DESC, imported_at DESC
-            LIMIT ?
+            """
+            SELECT * FROM experiments
+            WHERE application = ? AND status = 'completed' AND efficiency_score IS NOT NULL
+            ORDER BY efficiency_score DESC, updated_at DESC LIMIT ?
             """,
-            (limit,),
+            (application, limit),
         ).fetchall()
-        current_source_group = None
-        current_source_plans: list[dict[str, Any]] = []
-        if source_path is not None and source_text is not None:
-            source_hash = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
-            current_source_group = _source_group(str(source_path), source_hash)
-        if evaluation_context_key or current_source_group:
-            context_column = "evaluation_context_key" if evaluation_context_key else "source_group"
-            context_value = evaluation_context_key or current_source_group
-            current_source_plans = [
-                {
-                    "name": row["design_point"],
-                    "status": row["experiment_status"],
-                    "pragmas": _pragmas_from_plan(row["pragma_plan_json"]),
-                    "rationale": row["rationale"],
-                    "runtime_ns": _to_nano_units(row["runtime_s"]),
-                    "power_w": row["power_w"],
-                    "energy_nj": _to_nano_units(row["energy_j"]),
-                    "lut": row["lut"],
-                    "efficiency_score": row["efficiency_score"],
-                }
-                for row in self.connection.execute(
-                    f"""
-                    SELECT design_point, experiment_status, pragma_plan_json, rationale,
-                           runtime_s, power_w, energy_j, lut, efficiency_score
-                    FROM {table}
-                    WHERE {context_column} = ? AND role != 'baseline'
-                    ORDER BY imported_at DESC
-                    LIMIT 100
-                    """,
-                    (context_value,),
-                ).fetchall()
-            ]
-        baseline_scores = [
-            row["efficiency_score"]
-            for row in self.connection.execute(
-                f"""
-                SELECT efficiency_score FROM {table}
-                WHERE {"evaluation_context_key" if evaluation_context_key else "source_group"} = ?
-                  AND role = 'baseline' AND experiment_status = 'completed'
-                ORDER BY imported_at DESC LIMIT 1
+        source_hash = (
+            hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+            if source_text is not None else None
+        )
+        current_rows: list[sqlite3.Row] = []
+        if evaluation_context_key:
+            current_rows = self.connection.execute(
+                """
+                SELECT * FROM experiments
+                WHERE application = ? AND evaluation_context_key = ? AND role != 'baseline'
+                ORDER BY updated_at DESC LIMIT 200
                 """,
-                (evaluation_context_key or current_source_group,),
+                (application, evaluation_context_key),
             ).fetchall()
-        ] if (evaluation_context_key or current_source_group) else []
-        completed_candidate_scores = [
-            item["efficiency_score"]
-            for item in current_source_plans
-            if item["status"] == "completed" and item["efficiency_score"] is not None
+        elif source_hash:
+            current_rows = self.connection.execute(
+                """
+                SELECT * FROM experiments
+                WHERE application = ? AND original_source_hash = ? AND role != 'baseline'
+                ORDER BY updated_at DESC LIMIT 200
+                """,
+                (application, source_hash),
+            ).fetchall()
+
+        baseline = self._latest_baseline(application, evaluation_context_key, source_hash)
+        incumbent = self.best_completed(evaluation_context_key) if evaluation_context_key else None
+        candidate_scores = [
+            float(row["efficiency_score"])
+            for row in current_rows
+            if row["status"] == "completed" and row["efficiency_score"] is not None
         ]
+        baseline_score = float(baseline["efficiency_score"]) if baseline else None
+        state = self.exploration_state(application, evaluation_context_key, source_hash)
+        schedule = None
+        if baseline:
+            schedule = _json_object(baseline["metrics_json"]).get("hls_schedule")
         return {
             "application": application,
-            "current_source_group": current_source_group,
+            "current_source_hash": source_hash,
             "evaluation_context_key": evaluation_context_key,
-            "current_source_plans": current_source_plans,
+            "baseline_schedule": schedule,
+            "incumbent_best": incumbent,
+            "exploration_state": state,
+            "current_source_plans": [_history_item(row, include_status=True) for row in current_rows],
             "current_context_summary": {
-                "baseline_score": baseline_scores[0] if baseline_scores else None,
-                "best_candidate_score": max(completed_candidate_scores, default=None),
-                "all_completed_candidates_below_baseline": bool(baseline_scores and completed_candidate_scores)
-                and all(score < baseline_scores[0] for score in completed_candidate_scores),
+                "baseline_score": baseline_score,
+                "best_candidate_score": max(candidate_scores, default=None),
+                "all_completed_candidates_below_baseline": bool(
+                    baseline_score is not None and candidate_scores
+                    and all(score < baseline_score for score in candidate_scores)
+                ),
+                "converged": state["converged"],
             },
-            "completed_experiments": [
-                {
-                    "source_type": row["source_type"],
-                    "source_group": row["source_group"],
-                    "experiment_set": row["experiment_set"],
-                    "design_order": row["design_order"],
-                    "name": row["design_point"],
-                    "kind": row["role"],
-                    "pragmas": _pragmas_from_plan(row["pragma_plan_json"]),
-                    "pragma_plan": _json_object(row["pragma_plan_json"]),
-                    "runtime_ns": _to_nano_units(row["runtime_s"]),
-                    "performance": row["performance_1_per_s"],
-                    "power_w": row["power_w"],
-                    "energy_nj": _to_nano_units(row["energy_j"]),
-                    "lut": row["lut"],
-                    "efficiency_score": row["efficiency_score"],
-                    "rationale": row["rationale"],
-                }
-                for row in rows
-            ],
+            "completed_experiments": [_history_item(row) for row in rows],
         }
+
+    def exploration_state(
+        self,
+        application: str,
+        evaluation_context_key: str | None,
+        source_hash: str | None = None,
+        convergence_rounds: int = 2,
+    ) -> dict[str, Any]:
+        if evaluation_context_key:
+            condition, value = "evaluation_context_key = ?", evaluation_context_key
+        elif source_hash:
+            condition, value = "original_source_hash = ?", source_hash
+        else:
+            return {"completed_batches": 0, "stagnant_batches": 0, "converged": False}
+        rows = self.connection.execute(
+            f"""
+            SELECT experiment_set, MIN(id) first_id,
+                   SUM(CASE WHEN role != 'baseline' THEN 1 ELSE 0 END) candidate_count,
+                   SUM(CASE WHEN role != 'baseline' AND status = 'planned'
+                            THEN 1 ELSE 0 END) pending_count,
+                   MAX(CASE WHEN role != 'baseline' AND status = 'completed'
+                            THEN efficiency_score END) batch_best
+            FROM experiments
+            WHERE application = ? AND {condition}
+            GROUP BY experiment_set ORDER BY first_id
+            """,
+            (application, value),
+        ).fetchall()
+        best = 1.0
+        stagnant = 0
+        completed = 0
+        for row in rows:
+            if int(row["candidate_count"] or 0) == 0 or int(row["pending_count"] or 0) > 0:
+                continue
+            score = row["batch_best"]
+            completed += 1
+            if score is not None and float(score) > best + 1e-9:
+                best = float(score)
+                stagnant = 0
+            else:
+                stagnant += 1
+        return {
+            "completed_batches": completed,
+            "stagnant_batches": stagnant,
+            "best_score": best,
+            "convergence_rounds": convergence_rounds,
+            "converged": stagnant >= convergence_rounds,
+        }
+
+    def best_completed(self, evaluation_context_key: str | None) -> dict[str, Any] | None:
+        if not evaluation_context_key:
+            return None
+        row = self.connection.execute(
+            """
+            SELECT * FROM experiments
+            WHERE evaluation_context_key = ? AND status = 'completed'
+              AND efficiency_score IS NOT NULL
+            ORDER BY efficiency_score DESC, updated_at DESC LIMIT 1
+            """,
+            (evaluation_context_key,),
+        ).fetchone()
+        return _experiment_record(row) if row else None
 
     def import_historical_records(
         self,
@@ -317,443 +343,293 @@ class ForgeDatabase:
         experiment_set: str,
         records: list[dict[str, Any]],
     ) -> int:
-        table = _history_table(application)
-        self.connection.execute(
-            f"DELETE FROM {table} WHERE experiment_set = ? AND source_type = ?",
-            (experiment_set, INITIAL_VALIDATED_SOURCE),
+        _validate_application(application)
+        baseline_source = next(
+            (str(item.get("source_code") or "") for item in records if item.get("role") == "baseline"),
+            "",
         )
-        normalised_records = [
-            _normalise_imported_record(application, experiment_set, record)
-            for record in records
-        ]
-        self.connection.executemany(
-            _history_insert_statement(table),
-            [
-                tuple(
-                    (record.get(column) if column != "source_type" else INITIAL_VALIDATED_SOURCE)
-                    for column in HISTORY_COLUMNS
-                )
-                for record in normalised_records
-            ],
-        )
+        count = 0
+        for item in records:
+            source = baseline_source or str(item.get("source_code") or "")
+            generated = str(item.get("source_code") or source)
+            metrics = _legacy_metrics(item)
+            self.connection.execute(
+                """
+                INSERT INTO experiments (
+                    source_type, application, evaluation_context_key, experiment_set,
+                    batch_number, design_order, design_point, role, status,
+                    original_source_hash, original_source_code, generated_source_code,
+                    top_function, pragma_plan_json, rationale, target_part,
+                    target_clock_period_ns, project_path, metrics_json, runtime_ns,
+                    performance, power_w, energy_nj, lut, efficiency_score, error,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(application, experiment_set, design_point) DO UPDATE SET
+                    status = excluded.status,
+                    generated_source_code = excluded.generated_source_code,
+                    pragma_plan_json = excluded.pragma_plan_json,
+                    metrics_json = excluded.metrics_json,
+                    runtime_ns = excluded.runtime_ns,
+                    power_w = excluded.power_w,
+                    energy_nj = excluded.energy_nj,
+                    lut = excluded.lut,
+                    efficiency_score = excluded.efficiency_score,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    INITIAL_VALIDATED_SOURCE,
+                    application,
+                    item.get("evaluation_context_key") or "",
+                    experiment_set,
+                    int(item.get("design_order", item.get("sort_index", 0)) or 0),
+                    item["design_point"],
+                    item.get("role", "candidate"),
+                    item.get("experiment_status", "completed"),
+                    hashlib.sha256(source.encode("utf-8")).hexdigest(),
+                    source,
+                    generated,
+                    item.get("top_function") or "",
+                    item.get("pragma_plan_json") or '{"pragmas": []}',
+                    item.get("rationale"),
+                    item.get("target_part"),
+                    item.get("target_clock_period_ns"),
+                    item.get("run_dir"),
+                    json.dumps(metrics, ensure_ascii=False),
+                    metrics.get("runtime_ns"),
+                    metrics.get("performance"),
+                    metrics.get("power_w"),
+                    metrics.get("energy_nj"),
+                    metrics.get("lut"),
+                    metrics.get("efficiency_score"),
+                    metrics.get("error"),
+                    item.get("imported_at") or _now(),
+                    _now(),
+                ),
+            )
+            count += 1
         self.connection.commit()
-        return len(normalised_records)
+        return count
+
+    def _run(self, run_id: str) -> AnalysisRun:
+        run = self._runs.get(run_id)
+        if run is None:
+            raise ValueError(f"Analysis run was not found: {run_id}")
+        return run
+
+    def _latest_baseline(
+        self,
+        application: str,
+        evaluation_context_key: str | None,
+        source_hash: str | None,
+    ) -> sqlite3.Row | None:
+        if evaluation_context_key:
+            condition, value = "evaluation_context_key = ?", evaluation_context_key
+        elif source_hash:
+            condition, value = "original_source_hash = ?", source_hash
+        else:
+            return None
+        return self.connection.execute(
+            f"""
+            SELECT * FROM experiments
+            WHERE application = ? AND {condition} AND role = 'baseline'
+              AND status = 'completed'
+            ORDER BY updated_at DESC LIMIT 1
+            """,
+            (application, value),
+        ).fetchone()
 
     def _create_schema(self) -> None:
         self.connection.executescript(
             """
             PRAGMA foreign_keys = ON;
-            CREATE TABLE IF NOT EXISTS code_projects (
-                id INTEGER PRIMARY KEY,
-                source_path TEXT NOT NULL,
-                source_hash TEXT NOT NULL UNIQUE,
-                source_text TEXT NOT NULL,
-                created_at TEXT NOT NULL
+            CREATE TABLE IF NOT EXISTS forge_schema (
+                version INTEGER NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS analysis_runs (
-                id TEXT PRIMARY KEY,
-                code_project_id INTEGER NOT NULL REFERENCES code_projects(id),
+            CREATE TABLE IF NOT EXISTS experiments (
+                id INTEGER PRIMARY KEY,
+                source_type TEXT NOT NULL,
                 application TEXT NOT NULL,
-                top_function TEXT NOT NULL,
-                static_report_path TEXT,
-                evaluation_context_key TEXT,
+                evaluation_context_key TEXT NOT NULL DEFAULT '',
+                experiment_set TEXT NOT NULL,
                 batch_number INTEGER,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS design_points (
-                id INTEGER PRIMARY KEY,
-                analysis_run_id TEXT NOT NULL REFERENCES analysis_runs(id),
-                point_key TEXT NOT NULL,
-                rank INTEGER,
-                name TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                pragmas_json TEXT NOT NULL,
-                project_path TEXT NOT NULL,
-                strategy TEXT,
+                design_order INTEGER NOT NULL DEFAULT 0,
+                design_point TEXT NOT NULL,
+                role TEXT NOT NULL,
+                status TEXT NOT NULL,
+                original_source_hash TEXT NOT NULL,
+                original_source_code TEXT NOT NULL,
+                generated_source_code TEXT NOT NULL,
+                top_function TEXT NOT NULL DEFAULT '',
+                pragma_plan_json TEXT NOT NULL DEFAULT '{"pragmas": []}',
                 rationale TEXT,
                 target_part TEXT,
                 target_clock_period_ns REAL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS experiment_results (
-                id INTEGER PRIMARY KEY,
-                design_point_id INTEGER NOT NULL REFERENCES design_points(id),
-                status TEXT NOT NULL,
-                metrics_json TEXT NOT NULL,
+                project_path TEXT,
+                metrics_json TEXT NOT NULL DEFAULT '{}',
                 runtime_ns REAL,
                 performance REAL,
                 power_w REAL,
                 energy_nj REAL,
                 lut INTEGER,
                 efficiency_score REAL,
-                created_at TEXT NOT NULL
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(application, experiment_set, design_point)
             );
-            CREATE TABLE IF NOT EXISTS artifacts (
-                id INTEGER PRIMARY KEY,
-                design_point_id INTEGER NOT NULL REFERENCES design_points(id),
-                kind TEXT NOT NULL,
-                path TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
+            CREATE INDEX IF NOT EXISTS idx_experiments_context
+                ON experiments(evaluation_context_key, status, efficiency_score DESC);
+            CREATE INDEX IF NOT EXISTS idx_experiments_application
+                ON experiments(application, status, efficiency_score DESC);
+            CREATE INDEX IF NOT EXISTS idx_experiments_source
+                ON experiments(original_source_hash, application);
             """
         )
-        for table in APPLICATION_TABLES.values():
-            self.connection.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {table} (
-                    source_type TEXT NOT NULL DEFAULT '{INITIAL_VALIDATED_SOURCE}',
-                    source_group TEXT NOT NULL,
-                    evaluation_context_key TEXT,
-                    experiment_set TEXT NOT NULL,
-                    design_order INTEGER NOT NULL,
-                    design_point TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    experiment_status TEXT NOT NULL,
-                    source_dir TEXT NOT NULL,
-                    source_code TEXT,
-                    pragma_plan_json TEXT NOT NULL,
-                    rationale TEXT,
-                    run_dir TEXT,
-                    report_dir TEXT,
-                    target_part TEXT,
-                    target_clock_period_ns REAL,
-                    estimated_clock_ns REAL,
-                    hls_latency_cycles REAL,
-                    hls_interval_cycles REAL,
-                    primary_loop TEXT,
-                    loop_ii REAL,
-                    loop_latency_cycles REAL,
-                    bram_18k INTEGER,
-                    dsp INTEGER,
-                    ff INTEGER,
-                    lut INTEGER,
-                    uram INTEGER,
-                    power_w REAL,
-                    dynamic_w REAL,
-                    static_w REAL,
-                    power_confidence TEXT,
-                    power_source TEXT,
-                    runtime_s REAL,
-                    performance_1_per_s REAL,
-                    performance_norm REAL,
-                    power_norm REAL,
-                    energy_j REAL,
-                    energy_norm REAL,
-                    lut_norm REAL,
-                    efficiency_score REAL,
-                    csynth_xml TEXT,
-                    power_report TEXT,
-                    raw_experiment_json TEXT NOT NULL,
-                    raw_metrics_json TEXT NOT NULL,
-                    metadata_json TEXT NOT NULL,
-                    imported_at TEXT NOT NULL,
-                    PRIMARY KEY (experiment_set, design_point)
-                )
-                """
-            )
-            _ensure_column(
-                self.connection,
-                table,
-                "source_type",
-                f"TEXT NOT NULL DEFAULT '{INITIAL_VALIDATED_SOURCE}'",
-            )
-            _rename_column_if_present(self.connection, table, "sort_index", "design_order")
-            _ensure_column(self.connection, table, "source_group", "TEXT")
-            _ensure_column(self.connection, table, "experiment_status", "TEXT")
-            self.connection.execute(
-                f"CREATE INDEX IF NOT EXISTS idx_{table}_efficiency "
-                f"ON {table}(efficiency_score DESC)"
-            )
-        _ensure_column(self.connection, "design_points", "strategy", "TEXT")
-        _ensure_column(self.connection, "design_points", "rationale", "TEXT")
-        _ensure_column(self.connection, "design_points", "target_part", "TEXT")
-        _ensure_column(
-            self.connection,
-            "design_points",
-            "target_clock_period_ns",
-            "REAL",
-        )
-        _ensure_column(self.connection, "analysis_runs", "evaluation_context_key", "TEXT")
-        _ensure_column(self.connection, "analysis_runs", "batch_number", "INTEGER")
-        for table in APPLICATION_TABLES.values():
-            _ensure_column(self.connection, table, "evaluation_context_key", "TEXT")
-        self._backfill_history_metadata()
-        self._backfill_missing_forge_history()
+        self._migrate_legacy_tables()
+        self.connection.execute("DELETE FROM forge_schema")
+        self.connection.execute("INSERT INTO forge_schema(version) VALUES (?)", (UNIFIED_SCHEMA_VERSION,))
         self.connection.commit()
 
-    def reserve_generated_batch(self, run_id: str) -> int:
-        """Assign the next source-level batch number when a run creates projects."""
-
-        run = self.connection.execute(
-            """
-            SELECT ar.batch_number, cp.source_path
-            FROM analysis_runs ar
-            JOIN code_projects cp ON cp.id = ar.code_project_id
-            WHERE ar.id = ?
-            """,
-            (run_id,),
-        ).fetchone()
-        if run is None:
-            raise ValueError(f"Analysis run was not found: {run_id}")
-        if run["batch_number"] is not None:
-            return int(run["batch_number"])
-
-        previous = self.connection.execute(
-            """
-            SELECT COALESCE(MAX(ar.batch_number), 0) AS last_batch
-            FROM analysis_runs ar
-            JOIN code_projects cp ON cp.id = ar.code_project_id
-            WHERE cp.source_path = ? AND ar.batch_number IS NOT NULL
-            """,
-            (run["source_path"],),
-        ).fetchone()
-        batch_number = int(previous["last_batch"]) + 1
-        self.connection.execute(
-            "UPDATE analysis_runs SET batch_number = ? WHERE id = ?",
-            (batch_number, run_id),
-        )
-        self.connection.commit()
-        return batch_number
-
-    def _backfill_history_metadata(self) -> None:
-        """Upgrade earlier local records using their generated project metadata when available."""
-
-        for point in self.connection.execute(
-            "SELECT id, project_path, target_part, target_clock_period_ns, strategy, rationale "
-            "FROM design_points"
-        ).fetchall():
-            config = _generated_project_configuration(point["project_path"])
-            if not config:
-                continue
-            solution = config.get("solution") if isinstance(config.get("solution"), dict) else {}
-            self.connection.execute(
-                """
-                UPDATE design_points
-                SET target_part = COALESCE(?, target_part),
-                    target_clock_period_ns = COALESCE(?, target_clock_period_ns),
-                    strategy = COALESCE(?, strategy),
-                    rationale = COALESCE(?, rationale)
-                WHERE id = ?
-                """,
-                (
-                    config.get("part"),
-                    config.get("clock_period_ns"),
-                    solution.get("strategy"),
-                    _solution_rationale(solution),
-                    point["id"],
-                ),
+    def _migrate_legacy_tables(self) -> None:
+        existing = {
+            row[0]
+            for row in self.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
-
-        for application, table in APPLICATION_TABLES.items():
-            rows = self.connection.execute(
-                f"""
-                SELECT rowid, source_type, source_dir, source_code, experiment_set,
-                       run_dir, pragma_plan_json, rationale, evaluation_context_key, raw_experiment_json
-                FROM {table}
-                """
-            ).fetchall()
+        }
+        legacy = [
+            (application, table)
+            for application, table in APPLICATION_TABLES.items()
+            if table in existing
+        ]
+        for application, table in legacy:
+            rows = self.connection.execute(f"SELECT * FROM {table}").fetchall()
+            by_set: dict[str, str] = {}
             for row in rows:
-                raw = _json_object(row["raw_experiment_json"])
-                source_hash = hashlib.sha256(
-                    (row["source_code"] or row["source_dir"]).encode("utf-8")
-                ).hexdigest()
-                source_group = (
-                    _source_group(row["source_dir"], source_hash)
-                    if row["source_type"] == FORGE_RUN_SOURCE
-                    else f"initial:{application}:{row['experiment_set']}"
-                )
-                status = str(raw.get("status") or "completed")
-                config = _generated_project_configuration(row["run_dir"])
-                evaluation_context_key = row["evaluation_context_key"] or _legacy_evaluation_context_key(
-                    row["source_code"] or row["source_dir"],
-                    config,
-                )
-                solution = config.get("solution") if isinstance(config.get("solution"), dict) else {}
-                solution_rationale = _solution_rationale(solution)
-                pragma_plan_json = row["pragma_plan_json"]
-                if solution:
-                    pragma_plan = _json_object(row["pragma_plan_json"])
-                    pragma_plan.setdefault("pragmas", solution.get("pragmas", []))
-                    pragma_plan["strategy"] = solution.get("strategy")
-                    pragma_plan["rationale"] = solution_rationale
-                    pragma_plan_json = json.dumps(pragma_plan, ensure_ascii=False)
+                if _row_value(row, "role") == "baseline":
+                    by_set[str(_row_value(row, "experiment_set") or "legacy")] = str(
+                        _row_value(row, "source_code") or ""
+                    )
+            for row in rows:
+                experiment_set = str(_row_value(row, "experiment_set") or "legacy")
+                candidate_source = str(_row_value(row, "source_code") or "")
+                original = by_set.get(experiment_set) or candidate_source
+                metrics = _legacy_metrics(dict(row))
+                project_path = _row_value(row, "run_dir")
+                generated = _generated_source_from_project(project_path) or candidate_source or original
                 self.connection.execute(
-                    f"""
-                    UPDATE {table}
-                    SET source_group = ?,
-                        experiment_status = ?,
-                        target_part = CASE WHEN ? IS NOT NULL THEN ? ELSE target_part END,
-                        target_clock_period_ns = CASE WHEN ? IS NOT NULL THEN ? ELSE target_clock_period_ns END,
-                        evaluation_context_key = ?,
-                        rationale = COALESCE(rationale, ?),
-                        pragma_plan_json = ?
-                    WHERE rowid = ?
+                    """
+                    INSERT OR IGNORE INTO experiments (
+                        source_type, application, evaluation_context_key, experiment_set,
+                        batch_number, design_order, design_point, role, status,
+                        original_source_hash, original_source_code, generated_source_code,
+                        top_function, pragma_plan_json, rationale, target_part,
+                        target_clock_period_ns, project_path, metrics_json, runtime_ns,
+                        performance, power_w, energy_nj, lut, efficiency_score, error,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        source_group,
-                        status,
-                        config.get("part") if config else None,
-                        config.get("part") if config else None,
-                        config.get("clock_period_ns") if config else None,
-                        config.get("clock_period_ns") if config else None,
-                        evaluation_context_key,
-                        solution_rationale,
-                        pragma_plan_json,
-                        row["rowid"],
+                        _row_value(row, "source_type") or INITIAL_VALIDATED_SOURCE,
+                        application,
+                        _row_value(row, "evaluation_context_key") or "",
+                        experiment_set,
+                        _json_object(_row_value(row, "metadata_json")).get("batch_number"),
+                        int(_row_value(row, "design_order") or 0),
+                        _row_value(row, "design_point") or "unnamed",
+                        _row_value(row, "role") or "candidate",
+                        _row_value(row, "experiment_status") or "completed",
+                        hashlib.sha256(original.encode("utf-8")).hexdigest(),
+                        original,
+                        generated,
+                        _project_metadata(project_path).get("top_function", ""),
+                        _row_value(row, "pragma_plan_json") or '{"pragmas": []}',
+                        _row_value(row, "rationale"),
+                        _row_value(row, "target_part"),
+                        _row_value(row, "target_clock_period_ns"),
+                        project_path,
+                        json.dumps(metrics, ensure_ascii=False),
+                        metrics.get("runtime_ns"),
+                        metrics.get("performance"),
+                        metrics.get("power_w"),
+                        metrics.get("energy_nj"),
+                        metrics.get("lut"),
+                        metrics.get("efficiency_score"),
+                        metrics.get("error"),
+                        _row_value(row, "imported_at") or _now(),
+                        _row_value(row, "imported_at") or _now(),
                     ),
                 )
-
-    def _backfill_missing_forge_history(self) -> None:
-        """Keep existing local run records and application history tables consistent."""
-
-        rows = self.connection.execute(
-            """
-            SELECT er.design_point_id, er.status, er.metrics_json, ar.application,
-                   ar.id AS analysis_run_id, ar.batch_number, dp.name
-            FROM experiment_results er
-            JOIN design_points dp ON dp.id = er.design_point_id
-            JOIN analysis_runs ar ON ar.id = dp.analysis_run_id
-            """
-        ).fetchall()
-        for row in rows:
-            table = _history_table(row["application"])
-            exists = self.connection.execute(
-                f"""
-                SELECT 1 FROM {table}
-                WHERE experiment_set = ? AND design_point = ?
-                """,
-                (
-                    _forge_experiment_set(
-                        row["analysis_run_id"], row["batch_number"]
-                    ),
-                    row["name"],
-                ),
-            ).fetchone()
-            if exists is None:
-                self._append_forge_history(
-                    int(row["design_point_id"]),
-                    _json_object(row["metrics_json"]),
-                    row["status"],
-                )
-
-    def _append_forge_history(
-        self,
-        design_point_id: int,
-        metrics: dict[str, Any],
-        status: str,
-    ) -> None:
-        row = self.connection.execute(
-            """
-            SELECT ar.application, ar.id AS analysis_run_id, ar.evaluation_context_key, ar.batch_number,
-                   cp.source_path, cp.source_hash,
-                   cp.source_text, dp.point_key, dp.rank, dp.name, dp.kind, dp.pragmas_json,
-                   dp.project_path, dp.strategy, dp.rationale, dp.target_part, dp.target_clock_period_ns
-            FROM design_points dp
-            JOIN analysis_runs ar ON ar.id = dp.analysis_run_id
-            JOIN code_projects cp ON cp.id = ar.code_project_id
-            WHERE dp.id = ?
-            """,
-            (design_point_id,),
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"Design point was not found: {design_point_id}")
-
-        pragmas = json.loads(row["pragmas_json"])
-        record = {
-            "source_type": FORGE_RUN_SOURCE,
-            "source_group": _source_group(row["source_path"], row["source_hash"]),
-            "evaluation_context_key": row["evaluation_context_key"],
-            "experiment_set": _forge_experiment_set(
-                row["analysis_run_id"], row["batch_number"]
-            ),
-            "design_order": 0 if row["rank"] is None else int(row["rank"]),
-            "design_point": row["name"],
-            "role": row["kind"],
-            "experiment_status": status,
-            "source_dir": row["source_path"],
-            "source_code": row["source_text"],
-            "pragma_plan_json": json.dumps(
-                {"strategy": row["strategy"], "rationale": row["rationale"], "pragmas": pragmas},
-                ensure_ascii=False,
-            ),
-            "rationale": row["rationale"],
-            "run_dir": row["project_path"],
-            "report_dir": None,
-            "target_part": row["target_part"],
-            "target_clock_period_ns": row["target_clock_period_ns"],
-            "estimated_clock_ns": metrics.get("clock_period_ns"),
-            "hls_latency_cycles": metrics.get("hls_latency_cycles") or metrics.get("latency_cycles"),
-            "hls_interval_cycles": metrics.get("initiation_interval"),
-            "primary_loop": None,
-            "loop_ii": metrics.get("initiation_interval"),
-            "loop_latency_cycles": None,
-            "bram_18k": metrics.get("bram"),
-            "dsp": metrics.get("dsp"),
-            "ff": metrics.get("ff"),
-            "lut": metrics.get("lut"),
-            "uram": None,
-            "power_w": metrics.get("power_w"),
-            "dynamic_w": None,
-            "static_w": None,
-            "power_confidence": None,
-            "power_source": None,
-            "runtime_s": _from_nano_units(metrics.get("runtime_ns")),
-            "performance_1_per_s": metrics.get("performance"),
-            "performance_norm": metrics.get("performance_norm"),
-            "power_norm": metrics.get("power_norm"),
-            "energy_j": _from_nano_units(metrics.get("energy_nj")),
-            "energy_norm": metrics.get("energy_norm"),
-            "lut_norm": metrics.get("lut_norm"),
-            "efficiency_score": metrics.get("efficiency_score"),
-            "csynth_xml": metrics.get("hls_report"),
-            "power_report": metrics.get("power_report"),
-            "raw_experiment_json": json.dumps(metrics, ensure_ascii=False),
-            "raw_metrics_json": json.dumps(metrics, ensure_ascii=False),
-            "metadata_json": json.dumps(
-                {
-                    "analysis_run_id": row["analysis_run_id"],
-                    "batch_number": row["batch_number"],
-                    "design_point_key": row["point_key"],
-                    "source_type": FORGE_RUN_SOURCE,
-                    "source_group": _source_group(row["source_path"], row["source_hash"]),
-                    "evaluation_context_key": row["evaluation_context_key"],
-                    "experiment_status": status,
-                    "latency_source": metrics.get("latency_source"),
-                    "cosim_latency_cycles": metrics.get("cosim_latency_cycles"),
-                    "strategy": row["strategy"],
-                },
-                ensure_ascii=False,
-            ),
-            "imported_at": _now(),
-        }
-        self.connection.execute(
-            _history_insert_statement(_history_table(row["application"])),
-            tuple(record[column] for column in HISTORY_COLUMNS),
-        )
+        if legacy:
+            for _, table in legacy:
+                self.connection.execute(f"DROP TABLE {table}")
+            for table in ("artifacts", "experiment_results", "design_points", "analysis_runs", "code_projects"):
+                if table in existing:
+                    self.connection.execute(f"DROP TABLE {table}")
 
 
-def _history_table(application: str) -> str:
-    table = APPLICATION_TABLES.get(application)
-    if table is None:
-        raise ValueError(f"Unsupported historical application: {application}")
-    return table
+def _validate_application(application: str) -> None:
+    if application not in SUPPORTED_APPLICATIONS:
+        raise ValueError(f"Unsupported application: {application}")
 
 
-def _history_insert_statement(table: str) -> str:
-    placeholders = ", ".join("?" for _ in HISTORY_COLUMNS)
-    return f"INSERT INTO {table} ({', '.join(HISTORY_COLUMNS)}) VALUES ({placeholders})"
+def _history_item(row: sqlite3.Row, include_status: bool = False) -> dict[str, Any]:
+    plan = _json_object(row["pragma_plan_json"])
+    metrics = _json_object(row["metrics_json"])
+    item = {
+        "source_type": row["source_type"],
+        "experiment_set": row["experiment_set"],
+        "design_order": row["design_order"],
+        "name": row["design_point"],
+        "kind": row["role"],
+        "pragmas": plan.get("pragmas", []),
+        "pragma_plan": plan,
+        "rationale": row["rationale"],
+        "runtime_ns": row["runtime_ns"],
+        "performance": row["performance"],
+        "power_w": row["power_w"],
+        "energy_nj": row["energy_nj"],
+        "lut": row["lut"],
+        "efficiency_score": row["efficiency_score"],
+        "hls_schedule": metrics.get("hls_schedule"),
+    }
+    if include_status:
+        item["status"] = row["status"]
+    return item
 
 
-def _normalise_imported_record(
-    application: str,
-    experiment_set: str,
-    record: dict[str, Any],
-) -> dict[str, Any]:
-    normalised = dict(record)
-    normalised.setdefault("source_group", f"initial:{application}:{experiment_set}")
-    normalised.setdefault("design_order", normalised.get("sort_index", 0))
-    normalised.setdefault("experiment_status", "completed")
-    return normalised
+def _experiment_record(row: sqlite3.Row) -> dict[str, Any]:
+    result = _history_item(row, include_status=True)
+    result.update({
+        "id": row["id"],
+        "project_path": row["project_path"],
+        "metrics": _json_object(row["metrics_json"]),
+    })
+    return result
+
+
+def _legacy_metrics(record: dict[str, Any]) -> dict[str, Any]:
+    metrics = _json_object(record.get("raw_metrics_json"))
+    experiment = _json_object(record.get("raw_experiment_json"))
+    metrics.update({key: value for key, value in experiment.items() if key not in metrics})
+    runtime_ns = record.get("runtime_ns")
+    if runtime_ns is None and record.get("runtime_s") is not None:
+        runtime_ns = float(record["runtime_s"]) * 1_000_000_000
+    energy_nj = record.get("energy_nj")
+    if energy_nj is None and record.get("energy_j") is not None:
+        energy_nj = float(record["energy_j"]) * 1_000_000_000
+    metrics.update({
+        "runtime_ns": runtime_ns if runtime_ns is not None else metrics.get("runtime_ns"),
+        "performance": record.get("performance", record.get("performance_1_per_s", metrics.get("performance"))),
+        "power_w": record.get("power_w", metrics.get("power_w")),
+        "energy_nj": energy_nj if energy_nj is not None else metrics.get("energy_nj"),
+        "lut": record.get("lut", metrics.get("lut")),
+        "efficiency_score": record.get("efficiency_score", metrics.get("efficiency_score")),
+        "hls_latency_cycles": record.get("hls_latency_cycles", metrics.get("hls_latency_cycles")),
+        "initiation_interval": record.get("hls_interval_cycles", metrics.get("initiation_interval")),
+        "clock_period_ns": record.get("estimated_clock_ns", metrics.get("clock_period_ns")),
+    })
+    return metrics
 
 
 def _forge_experiment_set(run_id: str, batch_number: int | None) -> str:
@@ -762,91 +638,50 @@ def _forge_experiment_set(run_id: str, batch_number: int | None) -> str:
     return f"forge_batch_{int(batch_number):03d}_{run_id}"
 
 
-def _ensure_column(
-    connection: sqlite3.Connection,
-    table: str,
-    column: str,
-    definition: str,
-) -> None:
-    columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
-    if column not in columns:
-        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
-
-def _rename_column_if_present(
-    connection: sqlite3.Connection,
-    table: str,
-    old_name: str,
-    new_name: str,
-) -> None:
-    columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
-    if old_name in columns and new_name not in columns:
-        connection.execute(f"ALTER TABLE {table} RENAME COLUMN {old_name} TO {new_name}")
-
-
-def _source_group(source_path: str, source_hash: str) -> str:
-    return f"{Path(source_path).stem}:{source_hash[:12]}"
-
-
-def _legacy_evaluation_context_key(source_text: str, metadata: dict[str, Any]) -> str:
-    testbench_signature = (
-        "auto" if metadata.get("testbench_generated") else
-        "custom_legacy" if metadata.get("has_testbench") else "none"
-    )
-    return build_evaluation_context_key(
-        source_text,
-        str(metadata.get("top_function", "")),
-        str(metadata.get("part", "")),
-        float(metadata.get("clock_period_ns") or 0.0),
-        testbench_signature,
-    )
-
-
-def _solution_rationale(solution: dict[str, Any]) -> str | None:
-    if not solution:
-        return None
-    fields = (
-        ("Strategy", solution.get("strategy")),
-        ("Expected effect", solution.get("expected_effect")),
-        ("Risk", solution.get("risk")),
-    )
-    lines = [f"{label}: {value}" for label, value in fields if value]
-    return "\n".join(lines) or None
-
-
-def _generated_project_configuration(project_path: str | None) -> dict[str, Any]:
-    if not project_path:
-        return {}
-    metadata_path = Path(project_path) / "project.json"
-    if not metadata_path.is_file():
-        return {}
-    return _json_object(metadata_path.read_text(encoding="utf-8", errors="ignore"))
-
-
-def _json_object(value: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(value)
-    except (TypeError, json.JSONDecodeError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
 def _point_key(project: dict[str, Any]) -> str:
     rank = project.get("rank")
     return "baseline" if rank is None else f"design_point_{int(rank):03d}"
 
 
-def _pragmas_from_plan(value: str) -> list[Any]:
-    plan = json.loads(value)
-    return plan.get("pragmas", []) if isinstance(plan, dict) else plan
+def _read_optional_text(path: Any) -> str | None:
+    if not path:
+        return None
+    candidate = Path(str(path))
+    if not candidate.is_file():
+        return None
+    return candidate.read_text(encoding="utf-8", errors="ignore")
 
 
-def _to_nano_units(value: float | None) -> float | None:
-    return float(value) * 1_000_000_000 if value is not None else None
+def _generated_source_from_project(project_path: Any) -> str | None:
+    if not project_path:
+        return None
+    src = Path(str(project_path)) / "src"
+    if not src.is_dir():
+        return None
+    candidates = sorted(src.glob("*.c"))
+    return _read_optional_text(candidates[0]) if candidates else None
 
 
-def _from_nano_units(value: float | None) -> float | None:
-    return float(value) / 1_000_000_000 if value is not None else None
+def _project_metadata(project_path: Any) -> dict[str, Any]:
+    if not project_path:
+        return {}
+    return _json_object(_read_optional_text(Path(str(project_path)) / "project.json"))
+
+
+def _json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _row_value(row: sqlite3.Row, name: str) -> Any:
+    return row[name] if name in row.keys() else None
 
 
 def _now() -> str:

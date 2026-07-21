@@ -1,0 +1,2 @@
+puts "FORGE_VITIS_PROBE_OK"
+exit
