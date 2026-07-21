@@ -206,10 +206,12 @@ coordinated pragma set. If the input source contains a non-top `main` function,
 FORGE removes it from the synthesis source because `main` belongs in the
 testbench.
 
-When `--run-vitis` is used, each project receives execution logs, HLS reports,
-and a Vivado `power_report.rpt`. FORGE writes the final ranking to the pragma
-report, archives all measurements in the configured database, and creates a ZIP archive
-for the best solution. `data/` is local history and is ignored by Git.
+When `--run-vitis` is used, FORGE first synthesizes the baseline and adds its
+achieved schedule to the AI context. Each project receives execution logs, HLS
+reports, and a Vivado `power_report.rpt`. FORGE writes the final ranking to the
+pragma report, archives all measurements in the configured database, and
+creates a ZIP archive for the best solution. `data/` is local history and is
+ignored by Git.
 Each `--generate` run adds a batch prefix to its source-local project folders, for
 example `generated/fir_filter_example/batch01_baseline/` and
 `generated/fir_filter_example/batch01_dp01_<name>/`. Later runs use `batch02`,
@@ -223,20 +225,14 @@ HLS latency while retaining the cosim measurement in the reports.
 The baseline participates in this ranking and is kept as the final result when
 every generated candidate has a lower efficiency score.
 
-The measured design-point summary is also written as:
-
-```text
-report/<source_name>_experiment_results.json
-report/<source_name>_experiment_results.csv
-report/<source_name>_experiment_results.md
-```
-
 FORGE prints concise stage updates for C simulation, C synthesis, co-simulation,
 and Vivado power estimation. Detailed tool output remains in each project's log
-files. Unsafe AI recommendations that pipeline non-innermost loops or override
-an existing source interface pragma are rejected before Vitis execution. FORGE
-also identifies loop-carried array dependencies during static analysis and does
-not allow direct `PIPELINE` or `UNROLL` recommendations for those loops.
+files. The generator accepts a controlled set of directives, including validated
+`BIND_STORAGE` and function-level `DATAFLOW`; unsupported directives such as
+generated `INTERFACE` changes are rejected before source generation. Unsafe AI
+recommendations that pipeline non-innermost loops are also rejected. FORGE
+identifies loop-carried array dependencies during static analysis and does not
+allow direct `PIPELINE` or `UNROLL` recommendations for those loops.
 After `csynth`, FORGE verifies generated pragmas against the HLS report and log.
 An ignored pragma or a pipeline that did not create its target loop is marked
 `invalid`, skipped for power estimation, and excluded from efficiency ranking.
@@ -264,22 +260,28 @@ FORGE stores every pragma target, directive, and directive-level rationale in
 `pragma_plan_json`, plus the design-point strategy, expected effect, and risk.
 For the same source, top function, part, clock, and testbench identity, earlier
 plans and measured results form one exploration context. The default `explore`
-mode requests new exact pragma plans in each batch; `verify` permits an earlier
-plan to be run again. Different source code or evaluation configuration starts
-a separate exploration context.
+mode requests new exact pragma plans in each batch. Repeated ranks are repaired
+individually, so valid new ranks are retained. After repeated non-improving
+batches, FORGE marks the bounded space as converged and permits at most one
+explicit verification of the historical incumbent. Different source code or
+evaluation configuration starts a separate exploration context.
 
-Each application history row includes a stable `source_group` for one exact C
-source, an `experiment_set` for one FORGE run, and `design_order` for baseline
-and design-point display order. Invalid runs are retained for diagnosis but are
-not sent to AI history or included in efficiency ranking. Target FPGA part,
-target clock, and the measured HLS clock are stored separately.
+Each experiment row includes the original and generated C source, an
+`experiment_set` for one FORGE run, and `design_order` for baseline and
+design-point display order. Invalid runs are retained for diagnosis but are not
+sent to AI history or included in efficiency ranking. Target FPGA part, target
+clock, and the measured HLS clock are stored separately. Per-point measurements
+are kept in SQLite; the pragma report contains the batch summary and the
+overall-best selection. When the current batch is worse, FORGE packages the
+historical overall best and reports that decision.
 
-Import the validated pragma exploration history into five application tables:
+Import the validated pragma exploration history into the unified experiment
+store:
 
 ```powershell
 python history_importer.py --source-root E:\AMDHLS\FOGRE_Pragma_Explore
 ```
 
-The imported tables are `history_vector_saxpy`, `history_matrix_multiply`,
-`history_fir_filter`, `history_reduction_dot`, and `history_conv2d_3x3`.
-The conv2d table uses the validated `conv2d_3x3_round2` dataset.
+The database contains `experiments` and `forge_schema`. Existing legacy
+`history_*` tables are migrated automatically. The conv2d import uses the
+validated `conv2d_3x3_round2` dataset.

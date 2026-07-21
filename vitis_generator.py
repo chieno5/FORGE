@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from ai_recommender import OptimizationSolution, PragmaDirective
+from ai_recommender import AUTO_GENERATION_DIRECTIVES, OptimizationSolution, PragmaDirective
 from models import AnalysisReport, FunctionAnalysis, LoopRegion
 from testbench_generator import generate_local_testbench
 
@@ -63,8 +63,6 @@ def generate_vitis_projects(
         raise VitisGenerationError(f"Invalid FPGA part format: {part}")
     if clock_period_ns <= 0:
         raise VitisGenerationError("Clock period must be greater than 0.")
-    if not solutions:
-        raise VitisGenerationError("At least one optimisation solution is required.")
     if testbench_path and auto_testbench:
         raise VitisGenerationError("Use either --testbench or --auto-testbench, not both.")
     if batch_number is not None and batch_number < 1:
@@ -380,16 +378,25 @@ def _validate_solution_safety(
     report: AnalysisReport,
     solution: OptimizationSolution,
 ) -> None:
-    existing_interface_ports = set(
-        re.findall(r"#pragma\s+HLS\s+INTERFACE\b[^\n]*\bport\s*=\s*([A-Za-z_]\w*)", source, flags=re.IGNORECASE)
-    )
     functions_by_name = {function.name: function for function in report.functions}
-    parameters_by_function = {
-        name: {_parameter_name(parameter) for parameter in function.parameters}
+    array_parameters_by_function = {
+        name: {
+            _parameter_name(parameter)
+            for parameter in function.parameters
+            if "[" in parameter or "*" in parameter
+        }
         for name, function in functions_by_name.items()
     }
+    local_arrays_by_function = {
+        name: _local_array_names(source, name) for name in functions_by_name
+    }
     for directive in solution.pragmas:
-        directive_name = directive.pragma.split()[2]
+        parts = directive.pragma.split()
+        directive_name = parts[2].upper() if len(parts) >= 3 else ""
+        if directive_name not in AUTO_GENERATION_DIRECTIVES:
+            raise VitisGenerationError(
+                f"Directive is not enabled for automatic generation: {directive_name}"
+            )
         if directive_name in {"PIPELINE", "UNROLL"}:
             function = functions_by_name.get(directive.target_function)
             loop = next(
@@ -415,35 +422,84 @@ def _validate_solution_safety(
                 raise VitisGenerationError(
                     f"{directive_name} cannot target a loop-carried dependency: {loop.id}"
                 )
-        if directive_name == "INTERFACE":
-            port = _pragma_option(directive.pragma, "port")
-            if port and port in existing_interface_ports:
-                raise VitisGenerationError(
-                    f"AI attempted to override an existing INTERFACE pragma for port: {port}"
-                )
+            option = "II" if directive_name == "PIPELINE" else "factor"
+            option_value = _pragma_integer_option(directive.pragma, option)
+            if re.search(rf"\b{option}\s*=", directive.pragma, flags=re.IGNORECASE):
+                allowed = {1, 2, 3, 4} if directive_name == "PIPELINE" else range(2, 9)
+                if option_value not in allowed:
+                    raise VitisGenerationError(
+                        f"{directive_name} {option} is outside the controlled range."
+                    )
         if directive_name == "BIND_STORAGE":
             variable = _pragma_option(directive.pragma, "variable")
-            if variable and variable in parameters_by_function.get(
+            storage_type = _pragma_option(directive.pragma, "type")
+            implementation = _pragma_option(directive.pragma, "impl")
+            if directive.target_loop_id or variable not in local_arrays_by_function.get(
                 directive.target_function, set()
             ):
                 raise VitisGenerationError(
-                    f"BIND_STORAGE cannot target external function parameter: {variable}"
+                    "BIND_STORAGE requires a function target and an existing local array: "
+                    f"{variable or '<missing>'}"
                 )
-        if directive_name == "ARRAY_PARTITION":
+            if storage_type not in {"ram_1p", "ram_2p"} or implementation not in {"bram", "lutram"}:
+                raise VitisGenerationError(
+                    "BIND_STORAGE must use type=ram_1p or ram_2p and impl=bram or lutram."
+                )
+        if directive_name == "DATAFLOW":
+            function = functions_by_name.get(directive.target_function)
+            calls = function.features.get("called_functions", {}) if function else {}
+            helper_calls = {
+                name for name in calls
+                if name in functions_by_name and name != directive.target_function
+            }
+            has_dependency = bool(function) and any(
+                loop.features.get("has_loop_carried_dependency", False)
+                for loop in function.loop_regions
+            )
+            if directive.target_loop_id or len(helper_calls) < 2 or has_dependency:
+                raise VitisGenerationError(
+                    "DATAFLOW requires a function with at least two existing helper stages "
+                    "and no known loop-carried dependency."
+                )
+        if directive_name in {"ARRAY_PARTITION", "ARRAY_RESHAPE"}:
             variable = _pragma_option(directive.pragma, "variable")
+            known_arrays = {
+                *array_parameters_by_function.get(directive.target_function, set()),
+                *local_arrays_by_function.get(directive.target_function, set()),
+            }
+            if variable not in known_arrays:
+                raise VitisGenerationError(
+                    f"{directive_name} requires a known array: {variable or '<missing>'}"
+                )
             if (
+                _is_complete_array_partition(directive.pragma)
+                and
                 variable
-                and variable in parameters_by_function.get(directive.target_function, set())
-                and _is_complete_array_partition(directive.pragma)
+                and variable in array_parameters_by_function.get(
+                    directive.target_function, set()
+                )
             ):
                 raise VitisGenerationError(
-                    f"ARRAY_PARTITION complete cannot target external function parameter: {variable}"
+                    f"{directive_name} complete cannot target external function parameter: {variable}"
+                )
+            style = re.search(r"\b(cyclic|block)\b", directive.pragma, flags=re.IGNORECASE)
+            factor = _pragma_integer_option(directive.pragma, "factor")
+            dim = _pragma_integer_option(directive.pragma, "dim")
+            if directive.target_loop_id or not style or factor not in {2, 4, 8} or dim != 1:
+                raise VitisGenerationError(
+                    f"{directive_name} requires a function target, cyclic/block style, "
+                    "factor 2, 4 or 8, and dim=1."
                 )
 
 
 def _pragma_option(pragma: str, option: str) -> str | None:
     match = re.search(rf"\b{re.escape(option)}\s*=\s*([A-Za-z_]\w*)", pragma)
     return match.group(1) if match else None
+
+
+def _pragma_integer_option(pragma: str, option: str) -> int | None:
+    match = re.search(rf"\b{re.escape(option)}\s*=\s*(\d+)", pragma, flags=re.IGNORECASE)
+    return int(match.group(1)) if match else None
 
 
 def _is_complete_array_partition(pragma: str) -> bool:
@@ -466,6 +522,32 @@ def _is_innermost_loop(loop_regions: list[LoopRegion], loop_id: str) -> bool:
 def _parameter_name(parameter: str) -> str:
     match = re.search(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\])*$", parameter.strip())
     return match.group(1) if match else ""
+
+
+def _local_array_names(source: str, function_name: str) -> set[str]:
+    body = _function_body_text(source, function_name)
+    return set(re.findall(
+        r"\b(?:const\s+)?(?:unsigned\s+|signed\s+)?"
+        r"(?:char|short|int|long|float|double|ap_[u]?int\s*<[^>]+>)\s+"
+        r"([A-Za-z_]\w*)\s*(?:\[[^\]]+\])+\s*;",
+        body,
+    ))
+
+
+def _function_body_text(source: str, function_name: str) -> str:
+    match = re.search(rf"\b{re.escape(function_name)}\s*\([^;]*?\)\s*\{{", source, re.S)
+    if match is None:
+        return ""
+    start = source.find("{", match.start())
+    depth = 0
+    for index in range(start, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start + 1:index]
+    return ""
 
 
 def _prepare_vitis_source(
