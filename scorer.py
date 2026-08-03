@@ -150,8 +150,15 @@ def _reasoning(
         negatives.append("many unknown function calls")
     if features.get("has_loop_carried_dependency", False):
         arrays = features.get("dependency_arrays", [])
-        detail = f" on {', '.join(arrays)}" if arrays else ""
-        negatives.append(f"loop-carried memory dependency{detail}")
+        variables = features.get("dependency_variables", [])
+        if arrays:
+            negatives.append(
+                f"loop-carried memory dependency on {', '.join(arrays)}"
+            )
+        if variables:
+            negatives.append(
+                f"scalar loop-carried dependency on {', '.join(variables)}"
+            )
 
     positive_text = ", ".join(positives) if positives else "limited compute-friendly structure"
     if negatives:

@@ -21,7 +21,7 @@ C source
   -> application classification and matching SQLite history
   -> AI recommendation for N energy-LUT design points
   -> baseline plus N Vitis HLS solution folders
-  -> optional supplied or locally generated smoke testbench
+  -> optional supplied or locally generated coverage testbench
   -> Vitis HLS, Vivado power estimation and report parsing
   -> efficiency_score ranking and final Vitis package
 ```
@@ -117,7 +117,9 @@ python forge.py INPUT [--json FILE] [--verbose]
                       [--design-points N] [--run-vitis] [--tool-timeout SECONDS]
                       [--top FUNCTION] [--output-root DIR]
                       [--part PART] [--clock NS]
-                      [--testbench FILE | --auto-testbench] [--include-dir DIR]
+                      [--testbench FILE | --auto-testbench]
+                      [--testbench-profile smoke|standard|full] [--testbench-seed N]
+                      [--include-dir DIR]
                       [--vitis-hls PATH] [--vivado PATH] [--amd-root PATH] [--database FILE]
 ```
 
@@ -140,7 +142,9 @@ python forge.py INPUT [--json FILE] [--verbose]
 | `--part PART` | `forge.toml` | FPGA part override. |
 | `--clock NS` | `forge.toml` | Target clock period override. |
 | `--testbench FILE` | none | Copies a user-provided C/C++ testbench into each project. |
-| `--auto-testbench` | off | Generates a local smoke testbench from the top function signature. Requires `--generate`. |
+| `--auto-testbench` | off | Generates a deterministic, self-checking testbench from the original B0 source and top interface. Requires `--generate`. |
+| `--testbench-profile PROFILE` | `full` | Selects 1 smoke case, 6 standard cases, or 13 full cases. |
+| `--testbench-seed N` | `20260803` | Sets the reproducible random-pattern seed for the automatic testbench. |
 | `--include-dir DIR` | none | Extra directory used to recursively resolve quoted local headers. Repeat when needed. |
 | `--vitis-hls PATH` | config/auto | Vitis HLS executable override. |
 | `--vivado PATH` | config/auto | Vivado executable override. |
@@ -193,6 +197,8 @@ hls_config.cfg
 run_hls.tcl
 run_hls.bat
 tb/<testbench>.c      # only with --testbench or --auto-testbench
+tb/<source>_golden.c  # original B0 reference for --auto-testbench
+tb/testbench_manifest.json
 ```
 
 `generated/<source_name>/` is a Vitis Unified IDE workspace. Each baseline or
@@ -220,8 +226,8 @@ number in their filenames.
 `--run-vitis` requires `--testbench` or `--auto-testbench`, so the final run
 includes `csim` and `cosim`.
 When a user supplies `--testbench`, efficiency scoring uses its measured cosim
-latency. `--auto-testbench` remains a smoke test, so scoring uses worst-case
-HLS latency while retaining the cosim measurement in the reports.
+latency. Automatic testbenches run several functional cases, but scoring still
+uses worst-case HLS latency so a changing case count cannot change the design score.
 The baseline participates in this ranking and is kept as the final result when
 every generated candidate has a lower efficiency score.
 
@@ -245,8 +251,18 @@ older installations can still be supplied with `--vitis-hls`.
 
 Use `--testbench FILE` when you already have a meaningful validation bench.
 
-`--auto-testbench` creates a simple local smoke testbench. It initializes inputs
-and calls the top function, but it is not a correctness oracle for the algorithm.
+`--auto-testbench` uses the original B0 source as a golden reference. It creates
+zero, constant, ordered, alternating, impulse, sparse, boundary-size, and fixed-seed
+random cases. Every case calls both the reference and the DUT, then checks the return
+value and all array or pointer parameters. The generated manifest records the exact
+profile, seed, cases, inferred parameter directions, oracle, and known limits.
+
+The testbench is generated once and frozen. B0, a refactored B1, and every pragma
+candidate receive the same files and identity. This keeps validation and scores
+comparable. The automatic inference cannot discover every legal input contract,
+pointer alias rule, global side effect, file input, or hardware protocol. Use a
+user testbench when these details matter; `full` means broad generated coverage,
+not a mathematical proof over every possible C input.
 
 ## Application History
 

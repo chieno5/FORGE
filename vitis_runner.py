@@ -47,6 +47,7 @@ class ExperimentResult:
     dsp: int | None
     power_w: float | None
     energy_nj: float | None
+    design_role: str = "candidate"
     latency_source: str | None = None
     hls_latency_cycles: float | None = None
     cosim_latency_cycles: float | None = None
@@ -421,6 +422,7 @@ def _run_one(
                 dsp=_as_int(metrics["dsp"]),
                 power_w=None,
                 energy_nj=None,
+                design_role=getattr(project, "design_role", "candidate"),
                 latency_source=latency_source,
                 hls_latency_cycles=hls_latency,
                 cosim_latency_cycles=cosim_latency,
@@ -470,6 +472,7 @@ def _run_one(
             dsp=_as_int(metrics["dsp"]),
             power_w=power_w,
             energy_nj=energy_nj,
+            design_role=getattr(project, "design_role", "candidate"),
             latency_source=latency_source,
             hls_latency_cycles=hls_latency,
             cosim_latency_cycles=cosim_latency,
@@ -882,6 +885,7 @@ def _failed_result(project: Any, error: Exception) -> ExperimentResult:
         dsp=None,
         power_w=None,
         energy_nj=None,
+        design_role=getattr(project, "design_role", "candidate"),
         error=str(error),
     )
 

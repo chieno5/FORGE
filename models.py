@@ -46,6 +46,25 @@ class FunctionAnalysis:
 
 
 @dataclass
+class StructuralConstraint:
+    """A source structure that can limit HLS scheduling or pragma effectiveness."""
+
+    id: str
+    constraint_type: str
+    function: str
+    loop_id: str
+    source_line: int
+    variables: list[str]
+    evidence: str
+    confidence: float
+    affected_pragmas: list[str] = field(default_factory=list)
+    supported_transformations: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class AnalysisReport:
     """Complete static-analysis report."""
 
@@ -54,6 +73,7 @@ class AnalysisReport:
     functions: list[FunctionAnalysis]
     parser: str = "pycparser"
     limitations: list[str] = field(default_factory=list)
+    structural_constraints: list[StructuralConstraint] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -62,4 +82,7 @@ class AnalysisReport:
             "parser": self.parser,
             "functions": [function.to_dict() for function in self.functions],
             "limitations": self.limitations,
+            "structural_constraints": [
+                constraint.to_dict() for constraint in self.structural_constraints
+            ],
         }

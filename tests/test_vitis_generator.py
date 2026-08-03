@@ -1,13 +1,73 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from ai_recommender import OptimizationSolution, PragmaDirective
 from models import AnalysisReport, FunctionAnalysis, LoopRegion
-from vitis_generator import VitisGenerationError, generate_vitis_projects
+from testbench_generator import generate_local_testbench
+from vitis_generator import (
+    VitisGenerationError,
+    freeze_testbench,
+    generate_vitis_projects,
+)
 
 
 class VitisGeneratorTests(unittest.TestCase):
+    def test_frozen_auto_testbench_is_generated_once_and_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "kernel.c"
+            source.write_text(
+                "void kernel(int input[16], int output[16]) {\n"
+                "  for (int i = 0; i < 16; ++i) output[i] = input[i];\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            function = FunctionAnalysis(
+                "kernel", "void", ["int input[16]", "int output[16]"], {}, 1
+            )
+            report = AnalysisReport(str(source), 60, [function])
+            solution = OptimizationSolution(
+                rank=1,
+                name="same_source",
+                strategy="test",
+                expected_effect="test",
+                risk="low",
+                confidence=1.0,
+                pragmas=[],
+            )
+
+            with patch(
+                "vitis_generator.generate_local_testbench",
+                wraps=generate_local_testbench,
+            ) as generator:
+                frozen = freeze_testbench(source, report, "kernel", auto_testbench=True)
+                baseline = generate_vitis_projects(
+                    source,
+                    report,
+                    [],
+                    "kernel",
+                    output_root=root / "generated",
+                    frozen_testbench=frozen,
+                )
+                candidates = generate_vitis_projects(
+                    source,
+                    report,
+                    [solution],
+                    "kernel",
+                    output_root=root / "generated",
+                    frozen_testbench=frozen,
+                    include_baseline=False,
+                )
+
+            self.assertEqual(generator.call_count, 1)
+            self.assertEqual(baseline[0].testbench_identity, candidates[0].testbench_identity)
+            self.assertEqual(
+                Path(baseline[0].testbench).read_bytes(),
+                Path(candidates[0].testbench).read_bytes(),
+            )
+
     def test_does_not_create_testbench_when_not_supplied(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -34,6 +94,7 @@ class VitisGeneratorTests(unittest.TestCase):
                 self.assertIsNone(project.testbench)
                 self.assertFalse((Path(project.directory) / "tb").exists())
                 tcl = Path(project.tcl_script).read_text(encoding="utf-8")
+                self.assertIn("cd $workspace_dir", tcl)
                 self.assertIn(f"open_component -reset {project.component_name}", tcl)
                 self.assertNotIn("open_project", tcl)
                 self.assertNotIn("open_solution", tcl)
@@ -180,8 +241,32 @@ class VitisGeneratorTests(unittest.TestCase):
                 testbench = Path(project.testbench)
                 testbench_text = testbench.read_text(encoding="utf-8")
                 self.assertIn("typedef unsigned char pixel_t;", testbench_text)
-                self.assertIn("kernel(input, output, n);", testbench_text)
+                self.assertIn("kernel(input_dut, output_dut, n);", testbench_text)
+                self.assertTrue((testbench.parent / "kernel_golden.c").is_file())
+                self.assertTrue((testbench.parent / "testbench_manifest.json").is_file())
                 self.assertIn("csim_design", Path(project.tcl_script).read_text(encoding="utf-8"))
+
+    def test_auto_testbench_identity_includes_profile_and_seed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "kernel.c"
+            source.write_text("void kernel(int data[8]) { data[0] += 1; }\n", encoding="utf-8")
+            report = AnalysisReport(
+                str(source), 60, [FunctionAnalysis("kernel", "void", ["int data[8]"], {})]
+            )
+
+            smoke = freeze_testbench(
+                source, report, "kernel", auto_testbench=True,
+                testbench_profile="smoke", testbench_seed=1,
+            )
+            full = freeze_testbench(
+                source, report, "kernel", auto_testbench=True,
+                testbench_profile="full", testbench_seed=2,
+            )
+
+            self.assertNotEqual(smoke.identity, full.identity)
+            self.assertEqual(smoke.manifest["case_count"], 1)
+            self.assertEqual(full.manifest["case_count"], 13)
 
     def test_rejects_interface_as_unsupported_automatic_directive(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

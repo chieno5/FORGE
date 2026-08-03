@@ -21,7 +21,7 @@ SUPPORTED_APPLICATIONS = frozenset((*APPLICATION_TABLES, "unclassified"))
 
 INITIAL_VALIDATED_SOURCE = "initial_validated"
 FORGE_RUN_SOURCE = "forge_run"
-UNIFIED_SCHEMA_VERSION = 2
+UNIFIED_SCHEMA_VERSION = 3
 
 
 @dataclass
@@ -95,8 +95,13 @@ class ForgeDatabase:
         if run.evaluation_context_key:
             row = self.connection.execute(
                 "SELECT COALESCE(MAX(batch_number), 0) FROM experiments "
-                "WHERE evaluation_context_key = ?",
-                (run.evaluation_context_key,),
+                "WHERE evaluation_context_key = ? OR "
+                "(original_source_hash = ? AND application = ?)",
+                (
+                    run.evaluation_context_key,
+                    run.original_source_hash,
+                    run.application,
+                ),
             ).fetchone()
         else:
             row = self.connection.execute(
@@ -119,6 +124,12 @@ class ForgeDatabase:
         run.batch_number = max([int(row[0]), *reserved], default=0) + 1
         return run.batch_number
 
+    def update_run_context(self, run_id: str, evaluation_context_key: str) -> None:
+        """Switch an unrecorded run back to its original source context after preflight fallback."""
+
+        run = self._run(run_id)
+        run.evaluation_context_key = evaluation_context_key
+
     def record_design_points(
         self,
         run_id: str,
@@ -127,8 +138,19 @@ class ForgeDatabase:
         run = self._run(run_id)
         experiment_set = _forge_experiment_set(run.id, run.batch_number)
         ids: dict[str, int] = {}
+        root_baseline_id: int | None = None
+        refactored_baseline_id: int | None = None
         for project in projects:
             point_key = _point_key(project)
+            design_role = str(project.get("design_role") or (
+                "original_baseline" if project.get("kind") == "baseline" else "candidate"
+            ))
+            if design_role == "original_baseline":
+                parent_experiment_id = None
+            elif design_role == "refactored_baseline":
+                parent_experiment_id = root_baseline_id
+            else:
+                parent_experiment_id = refactored_baseline_id or root_baseline_id
             generated_source = _read_optional_text(project.get("source_file"))
             plan = {
                 "strategy": project.get("strategy"),
@@ -140,10 +162,11 @@ class ForgeDatabase:
                 INSERT INTO experiments (
                     source_type, application, evaluation_context_key, experiment_set,
                     batch_number, design_order, design_point, role, status,
+                    design_role, parent_experiment_id, root_baseline_id,
                     original_source_hash, original_source_code, generated_source_code,
-                    top_function, pragma_plan_json, rationale, target_part,
+                    top_function, pragma_plan_json, transformation_json, rationale, target_part,
                     target_clock_period_ns, project_path, metrics_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?)
                 """,
                 (
                     FORGE_RUN_SOURCE,
@@ -154,11 +177,15 @@ class ForgeDatabase:
                     int(project.get("rank") or 0),
                     project["name"],
                     project["kind"],
+                    design_role,
+                    parent_experiment_id,
+                    root_baseline_id,
                     run.original_source_hash,
                     run.original_source_code,
                     generated_source or run.original_source_code,
                     run.top_function,
                     json.dumps(plan, ensure_ascii=False),
+                    json.dumps(project.get("transformation") or {}, ensure_ascii=False),
                     project.get("rationale"),
                     project.get("target_part"),
                     project.get("target_clock_period_ns"),
@@ -167,7 +194,16 @@ class ForgeDatabase:
                     _now(),
                 ),
             )
-            ids[point_key] = int(cursor.lastrowid)
+            experiment_id = int(cursor.lastrowid)
+            if design_role == "original_baseline":
+                root_baseline_id = experiment_id
+                self.connection.execute(
+                    "UPDATE experiments SET root_baseline_id = ? WHERE id = ?",
+                    (experiment_id, experiment_id),
+                )
+            elif design_role == "refactored_baseline":
+                refactored_baseline_id = experiment_id
+            ids[point_key] = experiment_id
         self.connection.commit()
         return ids
 
@@ -431,9 +467,11 @@ class ForgeDatabase:
         return self.connection.execute(
             f"""
             SELECT * FROM experiments
-            WHERE application = ? AND {condition} AND role = 'baseline'
+            WHERE application = ? AND {condition}
+              AND design_role IN ('original_baseline', 'refactored_baseline')
               AND status = 'completed'
-            ORDER BY updated_at DESC LIMIT 1
+            ORDER BY CASE design_role WHEN 'refactored_baseline' THEN 0 ELSE 1 END,
+                     updated_at DESC LIMIT 1
             """,
             (application, value),
         ).fetchone()
@@ -456,11 +494,15 @@ class ForgeDatabase:
                 design_point TEXT NOT NULL,
                 role TEXT NOT NULL,
                 status TEXT NOT NULL,
+                design_role TEXT NOT NULL DEFAULT 'candidate',
+                parent_experiment_id INTEGER,
+                root_baseline_id INTEGER,
                 original_source_hash TEXT NOT NULL,
                 original_source_code TEXT NOT NULL,
                 generated_source_code TEXT NOT NULL,
                 top_function TEXT NOT NULL DEFAULT '',
                 pragma_plan_json TEXT NOT NULL DEFAULT '{"pragmas": []}',
+                transformation_json TEXT NOT NULL DEFAULT '{}',
                 rationale TEXT,
                 target_part TEXT,
                 target_clock_period_ns REAL,
@@ -485,10 +527,58 @@ class ForgeDatabase:
                 ON experiments(original_source_hash, application);
             """
         )
+        self._ensure_unified_columns()
         self._migrate_legacy_tables()
+        self._ensure_unified_columns()
         self.connection.execute("DELETE FROM forge_schema")
         self.connection.execute("INSERT INTO forge_schema(version) VALUES (?)", (UNIFIED_SCHEMA_VERSION,))
         self.connection.commit()
+
+    def _ensure_unified_columns(self) -> None:
+        columns = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(experiments)")
+        }
+        additions = {
+            "design_role": "TEXT NOT NULL DEFAULT 'candidate'",
+            "parent_experiment_id": "INTEGER",
+            "root_baseline_id": "INTEGER",
+            "transformation_json": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                self.connection.execute(
+                    f"ALTER TABLE experiments ADD COLUMN {name} {declaration}"
+                )
+        self.connection.execute(
+            "UPDATE experiments SET design_role = 'original_baseline' "
+            "WHERE role = 'baseline' AND design_role = 'candidate'"
+        )
+        self.connection.execute(
+            """
+            UPDATE experiments
+            SET root_baseline_id = (
+                SELECT MIN(root.id) FROM experiments AS root
+                WHERE root.application = experiments.application
+                  AND root.experiment_set = experiments.experiment_set
+                  AND root.role = 'baseline'
+            )
+            WHERE root_baseline_id IS NULL
+            """
+        )
+        self.connection.execute(
+            """
+            UPDATE experiments
+            SET parent_experiment_id = root_baseline_id
+            WHERE parent_experiment_id IS NULL
+              AND design_role != 'original_baseline'
+              AND root_baseline_id IS NOT NULL
+            """
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_experiments_root "
+            "ON experiments(root_baseline_id, status, efficiency_score DESC)"
+        )
 
     def _migrate_legacy_tables(self) -> None:
         existing = {
@@ -582,6 +672,12 @@ def _history_item(row: sqlite3.Row, include_status: bool = False) -> dict[str, A
         "design_order": row["design_order"],
         "name": row["design_point"],
         "kind": row["role"],
+        "design_role": _row_value(row, "design_role") or (
+            "original_baseline" if row["role"] == "baseline" else "candidate"
+        ),
+        "parent_experiment_id": _row_value(row, "parent_experiment_id"),
+        "root_baseline_id": _row_value(row, "root_baseline_id"),
+        "transformation": _json_object(_row_value(row, "transformation_json")),
         "pragmas": plan.get("pragmas", []),
         "pragma_plan": plan,
         "rationale": row["rationale"],
@@ -639,6 +735,9 @@ def _forge_experiment_set(run_id: str, batch_number: int | None) -> str:
 
 
 def _point_key(project: dict[str, Any]) -> str:
+    explicit = project.get("record_key")
+    if explicit:
+        return str(explicit)
     rank = project.get("rank")
     return "baseline" if rank is None else f"design_point_{int(rank):03d}"
 

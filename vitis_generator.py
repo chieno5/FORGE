@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 from ai_recommender import AUTO_GENERATION_DIRECTIVES, OptimizationSolution, PragmaDirective
 from models import AnalysisReport, FunctionAnalysis, LoopRegion
-from testbench_generator import generate_local_testbench
+from testbench_generator import DEFAULT_TEST_SEED, generate_local_testbench
 
 
 LOCAL_INCLUDE_PATTERN = re.compile(r'^\s*#include\s+"([^\"]+)"', re.MULTILINE)
@@ -22,6 +23,8 @@ class VitisGenerationError(RuntimeError):
 @dataclass(frozen=True)
 class GeneratedProject:
     kind: str
+    design_role: str
+    record_key: str
     rank: int | None
     name: str
     pragmas: list[dict[str, Any]]
@@ -36,6 +39,9 @@ class GeneratedProject:
     component_name: str = ""
     target_part: str = ""
     target_clock_period_ns: float = 0.0
+    testbench_identity: str = ""
+    testbench_manifest: dict[str, Any] | None = None
+    transformation: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -51,8 +57,20 @@ def generate_vitis_projects(
     clock_period_ns: float = 10.0,
     testbench_path: str | Path | None = None,
     auto_testbench: bool = False,
+    testbench_profile: str = "full",
+    testbench_seed: int = DEFAULT_TEST_SEED,
     include_dirs: list[str | Path] | None = None,
     batch_number: int | None = None,
+    frozen_testbench: "TestbenchInput | None" = None,
+    include_baseline: bool = True,
+    baseline_project_label: str = "baseline",
+    baseline_display_name: str = "Baseline",
+    baseline_result_kind: str = "baseline",
+    baseline_design_role: str = "original_baseline",
+    baseline_record_key: str = "baseline",
+    baseline_rationale: str = "Baseline without added pragmas.",
+    transformation: dict[str, Any] | None = None,
+    project_root_name: str | None = None,
 ) -> list[GeneratedProject]:
     source = Path(source_path)
     if not source.exists():
@@ -65,38 +83,51 @@ def generate_vitis_projects(
         raise VitisGenerationError("Clock period must be greater than 0.")
     if testbench_path and auto_testbench:
         raise VitisGenerationError("Use either --testbench or --auto-testbench, not both.")
+    if frozen_testbench is not None and (testbench_path or auto_testbench):
+        raise VitisGenerationError(
+            "A frozen testbench cannot be combined with testbench_path or auto_testbench."
+        )
     if batch_number is not None and batch_number < 1:
         raise VitisGenerationError("batch_number must be at least 1 when provided.")
 
     top_analysis = _find_function(report, top_function)
     original_source = source.read_text(encoding="utf-8")
     headers = _resolve_local_headers(source, include_dirs or [])
-    testbench = _resolve_testbench(
+    testbench = frozen_testbench or _resolve_testbench(
         source=source,
         source_text=original_source,
         top_analysis=top_analysis,
         testbench_path=testbench_path,
         auto_testbench=auto_testbench,
+        testbench_profile=testbench_profile,
+        testbench_seed=testbench_seed,
     )
-    project_root = Path(output_root) / source.stem
+    project_root = Path(output_root) / (project_root_name or source.stem)
     batch_prefix = f"batch{batch_number:02d}_" if batch_number is not None else ""
     project_root.mkdir(parents=True, exist_ok=True)
     generated: list[GeneratedProject] = []
 
-    generated.append(
-        _write_project(
-            project_dir=project_root / f"{batch_prefix}baseline",
-            source=source,
-            source_text=_prepare_vitis_source(original_source, report, top_function),
-            testbench=testbench,
-            headers=headers,
-            top_function=top_function,
-            part=part,
-            clock_period_ns=clock_period_ns,
-            solution=None,
-            workspace_directory=project_root,
+    if include_baseline:
+        generated.append(
+            _write_project(
+                project_dir=project_root / f"{batch_prefix}{baseline_project_label}",
+                source=source,
+                source_text=_prepare_vitis_source(original_source, report, top_function),
+                testbench=testbench,
+                headers=headers,
+                top_function=top_function,
+                part=part,
+                clock_period_ns=clock_period_ns,
+                solution=None,
+                workspace_directory=project_root,
+                result_kind=baseline_result_kind,
+                design_role=baseline_design_role,
+                record_key=baseline_record_key,
+                display_name=baseline_display_name,
+                baseline_rationale=baseline_rationale,
+                transformation=transformation,
+            )
         )
-    )
 
     for solution in solutions:
         _validate_solution_safety(original_source, report, solution)
@@ -106,14 +137,20 @@ def generate_vitis_projects(
             _write_project(
                 project_dir=project_root / project_name,
                 source=source,
-            source_text=_prepare_vitis_source(transformed, report, top_function),
-            testbench=testbench,
-            headers=headers,
+                source_text=_prepare_vitis_source(transformed, report, top_function),
+                testbench=testbench,
+                headers=headers,
                 top_function=top_function,
                 part=part,
                 clock_period_ns=clock_period_ns,
                 solution=solution,
                 workspace_directory=project_root,
+                result_kind="solution",
+                design_role="candidate",
+                record_key=f"design_point_{solution.rank:03d}",
+                display_name=solution.name,
+                baseline_rationale="",
+                transformation=None,
             )
         )
 
@@ -132,6 +169,12 @@ def _write_project(
     clock_period_ns: float,
     solution: OptimizationSolution | None,
     workspace_directory: Path,
+    result_kind: str,
+    design_role: str,
+    record_key: str,
+    display_name: str,
+    baseline_rationale: str,
+    transformation: dict[str, Any] | None,
 ) -> GeneratedProject:
     src_dir = project_dir / "src"
     tb_dir = project_dir / "tb"
@@ -151,6 +194,16 @@ def _write_project(
         else:
             copied_testbench.write_text(testbench.source, encoding="utf-8")
             testbench_generated = True
+        # Support files are testbench data and are never added to synthesis.
+        for filename, contents in testbench.support_files.items():
+            support_path = _safe_testbench_support_path(tb_dir, filename)
+            support_path.parent.mkdir(parents=True, exist_ok=True)
+            support_path.write_text(contents, encoding="utf-8")
+        if testbench.manifest:
+            (tb_dir / "testbench_manifest.json").write_text(
+                json.dumps(testbench.manifest, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
         _copy_headers(headers, tb_dir)
 
     tcl_path = project_dir / "run_hls.tcl"
@@ -179,7 +232,8 @@ def _write_project(
     pragmas = [item.to_dict() for item in solution.pragmas] if solution else []
     metadata = {
         "project": "FORGE",
-        "kind": "solution" if solution else "baseline",
+        "kind": result_kind,
+        "design_role": design_role,
         "optimization_objective": "energy_lut_efficiency",
         "top_function": top_function,
         "part": part,
@@ -187,6 +241,9 @@ def _write_project(
         "solution": solution.to_dict() if solution else None,
         "has_testbench": copied_testbench is not None,
         "testbench_generated": testbench_generated,
+        "testbench_identity": testbench.identity if testbench else None,
+        "testbench_manifest": testbench.manifest if testbench else None,
+        "transformation": transformation,
         "vitis_workspace": str(workspace_directory),
         "vitis_component": project_dir.name,
     }
@@ -196,12 +253,14 @@ def _write_project(
     )
 
     return GeneratedProject(
-        kind="solution" if solution else "baseline",
+        kind=result_kind,
+        design_role=design_role,
+        record_key=record_key,
         rank=solution.rank if solution else None,
-        name=solution.name if solution else "Baseline",
+        name=solution.name if solution else display_name,
         pragmas=pragmas,
         strategy=solution.strategy if solution else None,
-        rationale=_solution_rationale(solution) if solution else "Baseline without added pragmas.",
+        rationale=_solution_rationale(solution) if solution else baseline_rationale,
         directory=str(project_dir),
         source_file=str(generated_source),
         tcl_script=str(tcl_path),
@@ -211,6 +270,9 @@ def _write_project(
         component_name=project_dir.name,
         target_part=part,
         target_clock_period_ns=clock_period_ns,
+        testbench_identity=testbench.identity if testbench else "",
+        testbench_manifest=testbench.manifest if testbench else None,
+        transformation=transformation,
     )
 
 
@@ -229,21 +291,35 @@ def _write_workspace_manifest(
 ) -> None:
     """Record the components belonging to one Vitis Unified IDE workspace."""
 
+    manifest_path = workspace_directory / "forge_workspace.json"
+    existing: dict[str, Any] = {}
+    if manifest_path.is_file():
+        try:
+            loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            loaded = {}
+        if isinstance(loaded, dict):
+            existing = loaded
+    components = {
+        str(item.get("name")): item
+        for item in existing.get("components", [])
+        if isinstance(item, dict) and item.get("name")
+    }
+    for project in projects:
+        components[project.component_name] = {
+            "name": project.component_name,
+            "kind": project.kind,
+            "design_role": project.design_role,
+            "directory": project.directory,
+            "vitis_component_file": str(Path(project.directory) / "vitis-comp.json"),
+        }
     manifest = {
         "project": "FORGE",
         "workspace_type": "vitis_unified_hls",
-        "source": str(source),
-        "components": [
-            {
-                "name": project.component_name,
-                "kind": project.kind,
-                "directory": project.directory,
-                "vitis_component_file": str(Path(project.directory) / "vitis-comp.json"),
-            }
-            for project in projects
-        ],
+        "source": existing.get("source") or str(source),
+        "components": list(components.values()),
     }
-    (workspace_directory / "forge_workspace.json").write_text(
+    manifest_path.write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
@@ -294,8 +370,37 @@ def _build_windows_runner(component_name: str) -> str:
 @dataclass(frozen=True)
 class TestbenchInput:
     filename: str
+    identity: str
     path: Path | None = None
     source: str | None = None
+    support_files: dict[str, str] = field(default_factory=dict)
+    manifest: dict[str, Any] = field(default_factory=dict)
+
+
+def freeze_testbench(
+    source_path: str | Path,
+    report: AnalysisReport,
+    top_function: str,
+    testbench_path: str | Path | None = None,
+    auto_testbench: bool = False,
+    testbench_profile: str = "full",
+    testbench_seed: int = DEFAULT_TEST_SEED,
+) -> TestbenchInput | None:
+    """Create or load the lineage testbench exactly once for later project reuse."""
+
+    source = Path(source_path)
+    if not source.is_file():
+        raise VitisGenerationError(f"Source file does not exist: {source}")
+    top_analysis = _find_function(report, top_function)
+    return _resolve_testbench(
+        source,
+        source.read_text(encoding="utf-8"),
+        top_analysis,
+        testbench_path,
+        auto_testbench,
+        testbench_profile,
+        testbench_seed,
+    )
 
 
 @dataclass(frozen=True)
@@ -310,16 +415,56 @@ def _resolve_testbench(
     top_analysis: FunctionAnalysis,
     testbench_path: str | Path | None,
     auto_testbench: bool,
+    testbench_profile: str = "full",
+    testbench_seed: int = DEFAULT_TEST_SEED,
 ) -> TestbenchInput | None:
     if testbench_path:
         path = Path(testbench_path)
         if not path.exists():
             raise VitisGenerationError(f"Testbench file does not exist: {path}")
-        return TestbenchInput(filename=path.name, path=path)
+        contents = path.read_bytes()
+        return TestbenchInput(
+            filename=path.name,
+            identity=hashlib.sha256(contents).hexdigest(),
+            path=path,
+            manifest={
+                "version": 1,
+                "profile": "user",
+                "oracle": "user_defined",
+                "case_count": None,
+            },
+        )
     if not auto_testbench:
         return None
-    generated = generate_local_testbench(source_text, source.stem, top_analysis)
-    return TestbenchInput(filename=generated.filename, source=generated.source)
+    generated = generate_local_testbench(
+        source_text,
+        source.stem,
+        top_analysis,
+        profile=testbench_profile,
+        seed=testbench_seed,
+    )
+    identity_payload = {
+        "filename": generated.filename,
+        "source": generated.source,
+        "support_files": generated.support_files,
+        "manifest": generated.manifest,
+    }
+    return TestbenchInput(
+        filename=generated.filename,
+        identity=hashlib.sha256(
+            json.dumps(identity_payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest(),
+        source=generated.source,
+        support_files=generated.support_files,
+        manifest=generated.manifest,
+    )
+
+
+def _safe_testbench_support_path(root: Path, filename: str) -> Path:
+    relative = Path(filename)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise VitisGenerationError(f"Unsafe generated testbench file path: {filename}")
+    return root / relative
 
 
 def _resolve_local_headers(
@@ -784,7 +929,9 @@ def _build_tcl(
     testbench_name: str | None,
 ) -> str:
     lines = [
-        "set script_dir [file dirname [file normalize [info script]]]",
+        "set script_dir [file dirname [info script]]",
+        "set workspace_dir [file dirname $script_dir]",
+        "cd $workspace_dir",
         f"open_component -reset {component_name} -flow_target vivado",
         f"set_top {top_function}",
         f"add_files -cflags {{-std=c99}} [file join $script_dir src {{{source_name}}}]",

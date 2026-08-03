@@ -19,7 +19,7 @@ from ai_recommender import (
     recommend_solutions,
 )
 from application_classifier import classify_application
-from analyzer import analyze_functions
+from analyzer import analyze_functions, find_structural_constraints
 from forge_database import ForgeDatabase, build_evaluation_context_key
 from models import AnalysisReport, FunctionAnalysis
 from parser import CParserError, parse_c_file
@@ -29,7 +29,18 @@ from report import (
     write_json_report,
 )
 from scorer import score_report
-from vitis_generator import VitisGenerationError, generate_vitis_projects
+from source_transformer import (
+    SourceTransformation,
+    TransformationAttempt,
+    apply_reduction_preflight_transform,
+)
+from testbench_generator import DEFAULT_TEST_SEED, TESTBENCH_PROFILES
+from vitis_generator import (
+    TestbenchInput,
+    VitisGenerationError,
+    freeze_testbench,
+    generate_vitis_projects,
+)
 from vitis_runner import (
     DEFAULT_TOOL_TIMEOUT_SECONDS,
     ExperimentResult,
@@ -45,7 +56,7 @@ PROJECT_NAME = "FORGE: FPGA Optimization and Reconfiguration Generation Engine"
 DEFAULT_THRESHOLD = 60
 REPORT_DIR = Path("report")
 DEFAULT_OUTPUT_ROOT = Path("generated")
-DEFAULT_DATABASE = Path("data") / "forge_test.db"
+DEFAULT_DATABASE = Path("data") / "forge_test_cPreflightFix.db"
 CONFIG_PATH = Path("forge.toml")
 ASCII_LOGO = """
  ███████╗ ██████╗ ██████╗  ██████╗ ███████╗
@@ -153,7 +164,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--auto-testbench",
         action="store_true",
-        help="Generate a local smoke testbench when --generate is used.",
+        help="Generate a deterministic self-checking testbench when --generate is used.",
+    )
+    parser.add_argument(
+        "--testbench-profile",
+        choices=TESTBENCH_PROFILES,
+        default="full",
+        help="Coverage level for --auto-testbench. Default: full.",
+    )
+    parser.add_argument(
+        "--testbench-seed",
+        type=int,
+        default=DEFAULT_TEST_SEED,
+        help=f"Fixed random seed for --auto-testbench. Default: {DEFAULT_TEST_SEED}.",
     )
     parser.add_argument(
         "--include-dir",
@@ -218,6 +241,9 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
     if args.auto_testbench and args.testbench:
         print("Error: use either --testbench or --auto-testbench, not both.", file=sys.stderr)
         return 2
+    if args.testbench_seed < 0 or args.testbench_seed > 0xFFFFFFFF:
+        print("Error: --testbench-seed must be between 0 and 4294967295.", file=sys.stderr)
+        return 2
 
     try:
         parsed = parse_c_file(args.input, args.include_dir)
@@ -235,6 +261,7 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
             "Scores are based on static heuristics.",
             "Complex C syntax may need cleanup before analysis.",
         ],
+        structural_constraints=find_structural_constraints(functions),
     )
 
     _print_tool_progress("Static analysis: complete")
@@ -253,22 +280,114 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
     if not needs_ai:
         return 0
 
-    source_text = Path(args.input).read_text(encoding="utf-8")
+    original_source_path = Path(args.input)
+    source_text = original_source_path.read_text(encoding="utf-8")
     application = classify_application(args.input, source_text, analysis_report)
     database = ForgeDatabase(args.database)
-    baseline_preflight_project = None
+    preflight_projects: list[object] = []
+    frozen_testbench: TestbenchInput | None = None
+    original_baseline_schedule = None
     baseline_schedule = None
+    active_source_path = original_source_path
+    active_source_text = source_text
+    active_report = analysis_report
+    transformed_static_report_path: Path | None = None
+    transformation_attempt = TransformationAttempt(
+        False,
+        source_text,
+        "source preflight was not requested for this run",
+    )
     try:
         top_function = _select_top_function(functions, args.top)
         part = args.part
         clock_period_ns = args.clock
         model = args.model
-        evaluation_context_key = build_evaluation_context_key(
+        if args.generate:
+            frozen_testbench = freeze_testbench(
+                original_source_path,
+                analysis_report,
+                top_function,
+                testbench_path=args.testbench,
+                auto_testbench=args.auto_testbench,
+                testbench_profile=args.testbench_profile,
+                testbench_seed=args.testbench_seed,
+            )
+            if args.auto_testbench and frozen_testbench:
+                _print_tool_progress(
+                    "Testbench preflight: frozen "
+                    f"{frozen_testbench.manifest.get('profile')} profile with "
+                    f"{frozen_testbench.manifest.get('case_count')} self-checking cases"
+                )
+        if args.generate and application.key == "reduction_dot":
+            transformation_attempt = apply_reduction_preflight_transform(
+                source_text,
+                analysis_report,
+                top_function,
+            )
+            if transformation_attempt.applied and transformation_attempt.transformation:
+                candidate_path = _write_preflight_source(
+                    args.output_root,
+                    original_source_path,
+                    transformation_attempt.transformation,
+                    transformation_attempt.source_text,
+                )
+                try:
+                    candidate_report = _analysis_report_for_source(
+                        candidate_path,
+                        [str(original_source_path.parent), *args.include_dir],
+                        threshold,
+                    )
+                except CParserError as exc:
+                    transformation_attempt = TransformationAttempt(
+                        False,
+                        source_text,
+                        f"transformed source did not parse: {exc}",
+                    )
+                else:
+                    if not _same_top_interface(
+                        analysis_report, candidate_report, top_function
+                    ):
+                        transformation_attempt = TransformationAttempt(
+                            False,
+                            source_text,
+                            "transformation changed the top function interface",
+                        )
+                    else:
+                        active_source_path = candidate_path
+                        active_source_text = transformation_attempt.source_text
+                        active_report = candidate_report
+                        transformed_static_report_path = (
+                            REPORT_DIR
+                            / f"{original_source_path.stem}_refactored_analysis_report.json"
+                        )
+                        write_json_report(active_report, transformed_static_report_path)
+                        _print_tool_progress(
+                            "Source preflight: applied controlled partial-accumulator "
+                            f"refactor to {transformation_attempt.transformation.loop_id}"
+                        )
+            if not transformation_attempt.applied:
+                _print_tool_progress(
+                    f"Source preflight: no refactored baseline selected - {transformation_attempt.reason}"
+                )
+
+        testbench_signature = (
+            "frozen:" + frozen_testbench.identity
+            if frozen_testbench is not None
+            else _testbench_signature(args)
+        )
+        original_context_key = build_evaluation_context_key(
             source_text,
             top_function,
             part,
             clock_period_ns,
-            _testbench_signature(args),
+            testbench_signature,
+        )
+        evaluation_context_key = build_evaluation_context_key(
+            active_source_text,
+            top_function,
+            part,
+            clock_period_ns,
+            testbench_signature,
         )
         run = database.create_run(
             source_text,
@@ -279,36 +398,107 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
         batch_number = database.reserve_generated_batch(run.id) if args.generate else None
         experience_context = database.history_context(
             application.key,
-            source_text=source_text,
+            source_text=active_source_text,
             evaluation_context_key=evaluation_context_key,
         )
         if args.generate and args.run_vitis:
             _print_tool_progress(
                 "Baseline preflight: synthesizing the unmodified source before AI recommendation"
             )
-            baseline_preflight_project = generate_vitis_projects(
-                source_path=args.input,
+            original_project = generate_vitis_projects(
+                source_path=original_source_path,
                 report=analysis_report,
                 solutions=[],
                 top_function=top_function,
                 output_root=args.output_root,
                 part=part,
                 clock_period_ns=clock_period_ns,
-                testbench_path=args.testbench,
-                auto_testbench=args.auto_testbench,
+                frozen_testbench=frozen_testbench,
                 include_dirs=args.include_dir,
                 batch_number=batch_number,
             )[0]
-            baseline_schedule = run_baseline_preflight(
-                baseline_preflight_project,
+            preflight_projects.append(original_project)
+            original_baseline_schedule = run_baseline_preflight(
+                original_project,
                 vitis_hls_command=args.vitis_hls,
                 amd_root=args.amd_root,
                 tool_timeout_seconds=args.tool_timeout,
                 progress_callback=_print_tool_progress,
             )
+            baseline_schedule = original_baseline_schedule
+            if transformation_attempt.applied and transformation_attempt.transformation:
+                refactored_project = generate_vitis_projects(
+                    source_path=active_source_path,
+                    report=active_report,
+                    solutions=[],
+                    top_function=top_function,
+                    output_root=args.output_root,
+                    part=part,
+                    clock_period_ns=clock_period_ns,
+                    frozen_testbench=frozen_testbench,
+                    include_dirs=[str(original_source_path.parent), *args.include_dir],
+                    batch_number=batch_number,
+                    baseline_project_label="refactored_baseline",
+                    baseline_display_name="Refactored Baseline",
+                    baseline_result_kind="solution",
+                    baseline_design_role="refactored_baseline",
+                    baseline_record_key="refactored_baseline",
+                    baseline_rationale=transformation_attempt.reason,
+                    transformation=transformation_attempt.transformation.to_dict(),
+                    project_root_name=original_source_path.stem,
+                )[0]
+                try:
+                    refactored_schedule = run_baseline_preflight(
+                        refactored_project,
+                        vitis_hls_command=args.vitis_hls,
+                        amd_root=args.amd_root,
+                        tool_timeout_seconds=args.tool_timeout,
+                        progress_callback=_print_tool_progress,
+                    )
+                except VitisExecutionError as exc:
+                    transformation_attempt = TransformationAttempt(
+                        False,
+                        source_text,
+                        f"refactored baseline failed HLS/testbench preflight: {exc}",
+                    )
+                    active_source_path = original_source_path
+                    active_source_text = source_text
+                    active_report = analysis_report
+                    evaluation_context_key = original_context_key
+                    database.update_run_context(run.id, evaluation_context_key)
+                    experience_context = database.history_context(
+                        application.key,
+                        source_text=source_text,
+                        evaluation_context_key=evaluation_context_key,
+                    )
+                    _print_tool_progress(
+                        "Source preflight: refactored baseline rejected; using original baseline"
+                    )
+                else:
+                    preflight_projects.append(refactored_project)
+                    baseline_schedule = refactored_schedule
+                    _print_tool_progress(
+                        "Source preflight: refactored baseline passed the frozen-testbench "
+                        "and HLS preflight"
+                    )
             experience_context["baseline_schedule"] = baseline_schedule
+            experience_context["source_preflight"] = _source_preflight_context(
+                analysis_report,
+                transformation_attempt,
+                frozen_testbench,
+                original_baseline_schedule,
+                baseline_schedule,
+            )
             _print_tool_progress(
                 "Baseline preflight: achieved schedule added to the AI context"
+            )
+        if "source_preflight" not in experience_context:
+            experience_context["source_preflight"] = _source_preflight_context(
+                analysis_report,
+                transformation_attempt,
+                frozen_testbench,
+                original_baseline_schedule,
+                baseline_schedule,
             )
         state = experience_context.get("exploration_state", {})
         if args.exploration_mode == "explore" and state.get("converged"):
@@ -321,7 +511,7 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
             f"AI recommendation: contacting OpenAI for {args.design_points} design points"
         )
         ai_result = recommend_solutions(
-            analysis_report,
+            active_report,
             top_function,
             part=part,
             clock_period_ns=clock_period_ns,
@@ -329,7 +519,7 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
             model=model,
             experience_context=experience_context,
             retry_callback=_print_ai_retry,
-            source_text=source_text,
+            source_text=active_source_text,
             exploration_mode=args.exploration_mode,
         )
     except VitisExecutionError as exc:
@@ -372,6 +562,7 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
     pragma_report = {
         "project": PROJECT_NAME,
         "source_file": str(Path(args.input)),
+        "active_source_file": str(active_source_path),
         "top_function": top_function,
         "optimization_objective": "energy_lut_efficiency",
         "application": application.to_dict(),
@@ -384,8 +575,17 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
         "target_part": part,
         "clock_period_ns": clock_period_ns,
         "baseline_schedule": baseline_schedule or experience_context.get("baseline_schedule"),
+        "original_baseline_schedule": original_baseline_schedule,
+        "source_preflight": experience_context["source_preflight"],
+        "testbench_identity": frozen_testbench.identity if frozen_testbench else None,
+        "testbench_manifest": frozen_testbench.manifest if frozen_testbench else None,
         "exploration_state": experience_context.get("exploration_state"),
         "static_report": str(static_report_path) if static_report_path else None,
+        "active_static_report": (
+            str(transformed_static_report_path)
+            if transformed_static_report_path and transformation_attempt.applied
+            else str(static_report_path) if static_report_path else None
+        ),
         "ai": ai_result.to_dict(),
         "generated_projects": [],
     }
@@ -398,19 +598,58 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
     selection_source = None
     if args.generate:
         try:
-            generated_projects = generate_vitis_projects(
-                source_path=args.input,
-                report=analysis_report,
+            generated_projects = list(preflight_projects)
+            if not generated_projects:
+                generated_projects.extend(generate_vitis_projects(
+                    source_path=original_source_path,
+                    report=analysis_report,
+                    solutions=[],
+                    top_function=top_function,
+                    output_root=args.output_root,
+                    part=part,
+                    clock_period_ns=clock_period_ns,
+                    frozen_testbench=frozen_testbench,
+                    include_dirs=args.include_dir,
+                    batch_number=batch_number,
+                ))
+                if transformation_attempt.applied and transformation_attempt.transformation:
+                    generated_projects.extend(generate_vitis_projects(
+                        source_path=active_source_path,
+                        report=active_report,
+                        solutions=[],
+                        top_function=top_function,
+                        output_root=args.output_root,
+                        part=part,
+                        clock_period_ns=clock_period_ns,
+                        frozen_testbench=frozen_testbench,
+                        include_dirs=[str(original_source_path.parent), *args.include_dir],
+                        batch_number=batch_number,
+                        baseline_project_label="refactored_baseline",
+                        baseline_display_name="Refactored Baseline",
+                        baseline_result_kind="solution",
+                        baseline_design_role="refactored_baseline",
+                        baseline_record_key="refactored_baseline",
+                        baseline_rationale=transformation_attempt.reason,
+                        transformation=transformation_attempt.transformation.to_dict(),
+                        project_root_name=original_source_path.stem,
+                    ))
+            generated_projects.extend(generate_vitis_projects(
+                source_path=active_source_path,
+                report=active_report,
                 solutions=ai_result.solutions,
                 top_function=top_function,
                 output_root=args.output_root,
                 part=part,
                 clock_period_ns=clock_period_ns,
-                testbench_path=args.testbench,
-                auto_testbench=args.auto_testbench,
-                include_dirs=args.include_dir,
+                frozen_testbench=frozen_testbench,
+                include_dirs=(
+                    [str(original_source_path.parent), *args.include_dir]
+                    if active_source_path != original_source_path else args.include_dir
+                ),
                 batch_number=batch_number,
-            )
+                include_baseline=False,
+                project_root_name=original_source_path.stem,
+            ))
         except VitisGenerationError as exc:
             database.close()
             print(f"Vitis generation error: {exc}", file=sys.stderr)
@@ -431,10 +670,9 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
                     amd_root=args.amd_root,
                     tool_timeout_seconds=args.tool_timeout,
                     progress_callback=_print_tool_progress,
-                    reuse_hls_directories=(
-                        [baseline_preflight_project.directory]
-                        if baseline_preflight_project is not None else None
-                    ),
+                    reuse_hls_directories=[
+                        project.directory for project in preflight_projects
+                    ],
                 )
             except VitisExecutionError as exc:
                 print(f"Vitis execution error: {exc}", file=sys.stderr)
@@ -494,6 +732,9 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
         item.to_dict() for item in generated_projects
     ]
     pragma_report["batch_evaluation"] = _batch_evaluation_summary(experiment_results)
+    pragma_report["relative_gain_diagnostics"] = _relative_gain_diagnostics(
+        experiment_results
+    )
     pragma_report["batch_best_design_point"] = (
         batch_best_result.to_dict() if batch_best_result else None
     )
@@ -695,6 +936,90 @@ def _select_top_function(
     return max(candidates, key=lambda function: function.score).name
 
 
+def _analysis_report_for_source(
+    source_path: str | Path,
+    include_dirs: list[str | Path],
+    threshold: int,
+) -> AnalysisReport:
+    parsed = parse_c_file(source_path, include_dirs)
+    functions = analyze_functions(parsed.functions)
+    score_report(functions, threshold)
+    return AnalysisReport(
+        file=str(Path(source_path)),
+        threshold=threshold,
+        functions=functions,
+        limitations=[
+            "Scores are based on static heuristics.",
+            "Complex C syntax may need cleanup before analysis.",
+        ],
+        structural_constraints=find_structural_constraints(functions),
+    )
+
+
+def _write_preflight_source(
+    output_root: str | Path,
+    original_source: str | Path,
+    transformation: SourceTransformation,
+    source_text: str,
+) -> Path:
+    original = Path(original_source)
+    directory = (
+        Path(output_root)
+        / original.stem
+        / "preflight_sources"
+        / transformation.transformed_source_hash[:12]
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / original.name
+    path.write_text(source_text, encoding="utf-8")
+    return path
+
+
+def _same_top_interface(
+    original_report: AnalysisReport,
+    transformed_report: AnalysisReport,
+    top_function: str,
+) -> bool:
+    original = next(
+        (item for item in original_report.functions if item.name == top_function), None
+    )
+    transformed = next(
+        (item for item in transformed_report.functions if item.name == top_function), None
+    )
+    return bool(
+        original
+        and transformed
+        and original.return_type == transformed.return_type
+        and original.parameters == transformed.parameters
+    )
+
+
+def _source_preflight_context(
+    report: AnalysisReport,
+    attempt: TransformationAttempt,
+    testbench: TestbenchInput | None,
+    original_schedule: object | None,
+    active_schedule: object | None,
+) -> dict[str, Any]:
+    manifest = testbench.manifest if testbench else {}
+    return {
+        "structural_constraints": [item.to_dict() for item in report.structural_constraints],
+        "applied": attempt.applied,
+        "reason": attempt.reason,
+        "transformation": attempt.transformation.to_dict() if attempt.transformation else None,
+        "testbench_identity": testbench.identity if testbench else None,
+        "testbench": {
+            "profile": manifest.get("profile"),
+            "case_count": manifest.get("case_count"),
+            "oracle": manifest.get("oracle"),
+            "comparison": manifest.get("comparison"),
+            "limitations": manifest.get("limitations", []),
+        } if testbench else None,
+        "original_baseline_schedule": original_schedule,
+        "active_baseline_schedule": active_schedule,
+    }
+
+
 def _resolve_report_path(json_output: str) -> Path:
     filename = Path(json_output).name or "analysis_report.json"
     return REPORT_DIR / filename
@@ -712,22 +1037,19 @@ def _record_experiment_results(
     generated_projects: list[object],
     experiment_results: list[object],
 ) -> None:
-    ranks_by_directory = {
-        _normalise_project_path(item.directory): item.rank
+    keys_by_directory = {
+        _normalise_project_path(item.directory): item.record_key
         for item in generated_projects
-        if item.rank is not None
     }
     for result in experiment_results:
-        if result.kind == "baseline":
-            point_key = "baseline"
-        else:
-            rank = ranks_by_directory.get(_normalise_project_path(result.project_directory))
-            if rank is None:
-                raise ValueError(
-                    "Experiment result does not match a generated design point: "
-                    f"{result.project_directory}"
-                )
-            point_key = f"design_point_{rank:03d}"
+        point_key = keys_by_directory.get(
+            _normalise_project_path(result.project_directory)
+        )
+        if point_key is None:
+            raise ValueError(
+                "Experiment result does not match a generated design point: "
+                f"{result.project_directory}"
+            )
         database.record_experiment(
             design_point_ids[point_key],
             result.to_dict(),
@@ -763,6 +1085,7 @@ def _historical_experiment_result(record: dict[str, Any] | None) -> ExperimentRe
         dsp=value("dsp"),
         power_w=value("power_w"),
         energy_nj=value("energy_nj"),
+        design_role=value("design_role", record.get("design_role", "candidate")),
         latency_source=value("latency_source"),
         hls_latency_cycles=value("hls_latency_cycles"),
         cosim_latency_cycles=value("cosim_latency_cycles"),
@@ -788,6 +1111,38 @@ def _batch_evaluation_summary(results: list[ExperimentResult]) -> dict[str, Any]
     return {"design_points": len(results), "status_counts": statuses}
 
 
+def _relative_gain_diagnostics(
+    results: list[ExperimentResult],
+) -> dict[str, Any] | None:
+    reference = next(
+        (
+            item for item in results
+            if item.design_role == "refactored_baseline"
+            and item.status == "completed"
+            and item.efficiency_score
+        ),
+        None,
+    )
+    if reference is None:
+        return None
+    candidates = []
+    for item in results:
+        if item.design_role != "candidate" or item.efficiency_score is None:
+            continue
+        candidates.append({
+            "name": item.name,
+            "efficiency_score_vs_original": item.efficiency_score,
+            "relative_gain_vs_refactored_baseline": (
+                item.efficiency_score / reference.efficiency_score
+            ),
+        })
+    return {
+        "refactored_baseline": reference.name,
+        "refactored_baseline_efficiency_score": reference.efficiency_score,
+        "candidates": candidates,
+    }
+
+
 def _choose_overall_best(
     batch_best: ExperimentResult,
     historical_record: dict[str, Any] | None,
@@ -810,7 +1165,9 @@ def _testbench_signature(args: argparse.Namespace) -> str:
     if args.testbench:
         contents = Path(args.testbench).read_bytes()
         return "custom:" + hashlib.sha256(contents).hexdigest()
-    return "auto" if args.auto_testbench else "none"
+    if args.auto_testbench:
+        return f"auto:{args.testbench_profile}:{args.testbench_seed}"
+    return "none"
 
 
 def _print_tool_progress(message: str) -> None:
@@ -846,7 +1203,14 @@ def _print_ai_retry(attempt: int, error: str) -> None:
 
 
 def _print_vitis_validation_summary(results: list[ExperimentResult]) -> None:
-    candidates = [item for item in results if item.kind != "baseline"]
+    candidates = [
+        item for item in results
+        if item.kind != "baseline" and getattr(
+            item,
+            "design_role",
+            "candidate",
+        ) == "candidate"
+    ]
     if not candidates:
         return
     passed = sum(item.status == "completed" for item in candidates)

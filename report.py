@@ -45,6 +45,18 @@ def print_human_report(report: AnalysisReport, verbose: bool = False) -> None:
         f"({best_function.score}/100, {best_function.classification})"
     )
 
+    if report.structural_constraints:
+        print()
+        print("Structural constraints")
+        print("-" * 72)
+        for constraint in report.structural_constraints:
+            transformations = ", ".join(constraint.supported_transformations) or "none"
+            print(
+                f"- {constraint.loop_id}: {constraint.constraint_type}; "
+                f"variables={', '.join(constraint.variables)}; "
+                f"controlled transforms={transformations}"
+            )
+
     if not verbose:
         return
 

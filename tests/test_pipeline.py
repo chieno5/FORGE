@@ -17,6 +17,7 @@ from analyzer import analyze_functions
 from models import AnalysisReport
 from parser import parse_c_file
 from scorer import score_report
+from testbench_generator import generate_local_testbench
 from forge import (
     _choose_overall_best,
     _print_ai_summary,
@@ -24,10 +25,229 @@ from forge import (
     _run_cli,
 )
 from vitis_generator import generate_vitis_projects
-from vitis_runner import ExperimentResult
+from vitis_runner import ExperimentResult, VitisExecutionError
 
 
 class ForgePipelineTests(unittest.TestCase):
+    def test_failed_refactored_preflight_falls_back_to_original_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "reduction_dot.c"
+            source.write_text(
+                "void reduction_dot(const int a[8], int out[1]) {\n"
+                "  int sum = 0;\n"
+                "  for (int i = 0; i < 8; ++i) { sum += a[i]; }\n"
+                "  out[0] = sum;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            def fake_preflight(project, *_args, **_kwargs):
+                if project.design_role == "refactored_baseline":
+                    raise VitisExecutionError("testbench rejected the transformed source")
+                return {"latency_cycles": 80, "loops": []}
+
+            def fake_recommend(_report, *_args, **kwargs):
+                self.assertNotIn("__forge_partial", kwargs["source_text"])
+                self.assertFalse(kwargs["experience_context"]["source_preflight"]["applied"])
+                return AIRecommendationResult(
+                    model="test",
+                    summary="use original source",
+                    solutions=[OptimizationSolution(
+                        rank=1, name="original_noop", strategy="safe",
+                        expected_effect="none", risk="low", confidence=0.8, pragmas=[],
+                    )],
+                )
+
+            def fake_run(projects, *_args, **_kwargs):
+                self.assertEqual(
+                    [project.design_role for project in projects],
+                    ["original_baseline", "candidate"],
+                )
+                return [
+                    ExperimentResult(**{
+                        **self._experiment_result(
+                            project.name, Path(project.directory),
+                            1.0 if project.kind == "baseline" else 0.9,
+                        ).to_dict(),
+                        "kind": project.kind,
+                        "design_role": project.design_role,
+                    })
+                    for project in projects
+                ]
+
+            with patch("forge.run_baseline_preflight", side_effect=fake_preflight), patch(
+                "forge.recommend_solutions", side_effect=fake_recommend
+            ), patch("forge.run_experiments", side_effect=fake_run), patch(
+                "forge.package_best_project",
+                side_effect=lambda result, *_args, **_kwargs: result,
+            ), patch("forge.REPORT_DIR", root / "report"):
+                code = _run_cli(
+                    [
+                        str(source), "--generate", "--run-vitis", "--auto-testbench",
+                        "--design-points", "1", "--database", str(root / "forge.db"),
+                        "--output-root", str(root / "generated"), "--top", "reduction_dot",
+                    ],
+                    False,
+                    {},
+                )
+
+            self.assertEqual(code, 0)
+            report_data = json.loads(
+                (root / "report" / "reduction_dot_batch01_pragma_report.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertFalse(report_data["source_preflight"]["applied"])
+            self.assertIn("failed", report_data["source_preflight"]["reason"])
+
+    def test_reduction_preflight_builds_one_comparable_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "reduction_dot.c"
+            source.write_text(
+                "void reduction_dot(const int a[16], int result[1], int n) {\n"
+                "  int sum = 0;\n"
+                "  for (int i = 0; i < n; ++i) { sum += a[i]; }\n"
+                "  result[0] = sum;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            events: list[str] = []
+            seen_projects: list[object] = []
+
+            def fake_preflight(project, *_args, **_kwargs):
+                events.append(f"preflight:{project.design_role}")
+                return {
+                    "latency_cycles": 100 if project.design_role == "original_baseline" else 60,
+                    "loops": [],
+                }
+
+            def fake_recommend(report, *_args, **kwargs):
+                events.append("recommend")
+                context = kwargs["experience_context"]["source_preflight"]
+                self.assertTrue(context["applied"])
+                self.assertEqual(context["testbench"]["profile"], "full")
+                self.assertEqual(context["testbench"]["case_count"], 13)
+                self.assertEqual(context["testbench"]["oracle"], "original_b0_source")
+                self.assertIn("sum__forge_partial", kwargs["source_text"])
+                self.assertEqual(
+                    context["structural_constraints"][0]["constraint_type"],
+                    "scalar_loop_carried_dependency",
+                )
+                self.assertFalse(
+                    report.functions[0].loop_regions[0].features[
+                        "has_scalar_loop_carried_dependency"
+                    ]
+                )
+                return AIRecommendationResult(
+                    model="test",
+                    summary="pipeline the refactored reduction",
+                    solutions=[OptimizationSolution(
+                        rank=1,
+                        name="refactored_pipeline",
+                        strategy="pipeline exposed lanes",
+                        expected_effect="lower II",
+                        risk="low",
+                        confidence=0.9,
+                        pragmas=[PragmaDirective(
+                            "reduction_dot",
+                            "reduction_dot.loop_1",
+                            "#pragma HLS PIPELINE II=1",
+                            "the scalar recurrence was split",
+                        )],
+                    )],
+                )
+
+            def fake_run(projects, *_args, **_kwargs):
+                seen_projects.extend(projects)
+                scores = {
+                    "original_baseline": 1.0,
+                    "refactored_baseline": 1.2,
+                    "candidate": 1.5,
+                }
+                return [
+                    ExperimentResult(**{
+                        **self._experiment_result(
+                            project.name,
+                            Path(project.directory),
+                            scores[project.design_role],
+                        ).to_dict(),
+                        "kind": project.kind,
+                        "design_role": project.design_role,
+                    })
+                    for project in projects
+                ]
+
+            def fake_package(result, *_args, **_kwargs):
+                return ExperimentResult(**{
+                    **result.to_dict(),
+                    "package_path": str(root / "best.zip"),
+                })
+
+            with patch("forge.run_baseline_preflight", side_effect=fake_preflight), patch(
+                "forge.recommend_solutions", side_effect=fake_recommend
+            ), patch("forge.run_experiments", side_effect=fake_run), patch(
+                "forge.package_best_project", side_effect=fake_package
+            ), patch(
+                "vitis_generator.generate_local_testbench",
+                wraps=generate_local_testbench,
+            ) as testbench_generator, patch("forge.REPORT_DIR", root / "report"):
+                code = _run_cli(
+                    [
+                        str(source), "--generate", "--run-vitis", "--auto-testbench",
+                        "--design-points", "1", "--database", str(root / "forge.db"),
+                        "--output-root", str(root / "generated"), "--top", "reduction_dot",
+                    ],
+                    show_banner=False,
+                    config={},
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                events,
+                [
+                    "preflight:original_baseline",
+                    "preflight:refactored_baseline",
+                    "recommend",
+                ],
+            )
+            self.assertEqual(testbench_generator.call_count, 1)
+            self.assertEqual(
+                {project.design_role for project in seen_projects},
+                {"original_baseline", "refactored_baseline", "candidate"},
+            )
+            self.assertEqual(
+                len({project.testbench_identity for project in seen_projects}),
+                1,
+            )
+
+            from forge_database import ForgeDatabase
+            database = ForgeDatabase(root / "forge.db")
+            rows = database.connection.execute(
+                "SELECT id, design_role, parent_experiment_id, root_baseline_id, "
+                "efficiency_score FROM experiments ORDER BY id"
+            ).fetchall()
+            self.assertEqual([row["design_role"] for row in rows], [
+                "original_baseline", "refactored_baseline", "candidate"
+            ])
+            self.assertEqual(rows[1]["parent_experiment_id"], rows[0]["id"])
+            self.assertEqual(rows[2]["parent_experiment_id"], rows[1]["id"])
+            database.close()
+
+            report_data = json.loads(
+                (root / "report" / "reduction_dot_batch01_pragma_report.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertAlmostEqual(
+                report_data["relative_gain_diagnostics"]["candidates"][0][
+                    "relative_gain_vs_refactored_baseline"
+                ],
+                1.25,
+            )
+            self.assertEqual(report_data["testbench_manifest"]["case_count"], 13)
+
     def test_ai_console_summary_is_bounded(self) -> None:
         solution = SimpleNamespace(rank=1, name="bounded")
         output = io.StringIO()

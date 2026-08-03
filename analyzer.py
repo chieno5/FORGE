@@ -6,7 +6,7 @@ from typing import Any
 
 from pycparser import c_ast
 
-from models import FunctionAnalysis, LoopRegion
+from models import FunctionAnalysis, LoopRegion, StructuralConstraint
 from parser import ParsedFunction
 
 
@@ -193,6 +193,48 @@ def analyze_functions(parsed_functions: list[ParsedFunction]) -> list[FunctionAn
     return [_analyze_function(function, function_names) for function in parsed_functions]
 
 
+def find_structural_constraints(
+    functions: list[FunctionAnalysis],
+) -> list[StructuralConstraint]:
+    """Turn low-level loop features into stable, AI-reportable constraints."""
+
+    constraints: list[StructuralConstraint] = []
+    for function in functions:
+        for loop in function.loop_regions:
+            recurrences = loop.features.get("scalar_recurrences", [])
+            if not recurrences:
+                continue
+            variables = sorted({str(item["variable"]) for item in recurrences})
+            operations = sorted({str(item["operation"]) for item in recurrences})
+            supported = (
+                ["partial_accumulator_v1"]
+                if loop.kind == "for"
+                and all(operation in {"add", "max", "min"} for operation in operations)
+                else []
+            )
+            constraints.append(
+                StructuralConstraint(
+                    id=f"{loop.id}.scalar_recurrence",
+                    constraint_type="scalar_loop_carried_dependency",
+                    function=function.name,
+                    loop_id=loop.id,
+                    source_line=loop.source_line,
+                    variables=variables,
+                    evidence=(
+                        "Loop updates scalar recurrence variable(s) across iterations: "
+                        + ", ".join(
+                            f"{item['variable']} ({item['operation']})"
+                            for item in recurrences
+                        )
+                    ),
+                    confidence=0.95,
+                    affected_pragmas=["PIPELINE", "UNROLL"],
+                    supported_transformations=supported,
+                )
+            )
+    return constraints
+
+
 def _analyze_function(
     function: ParsedFunction,
     function_names: set[str],
@@ -370,7 +412,10 @@ def _loop_memory_dependency_features(node: c_ast.Node) -> dict[str, Any]:
         for name, offset in visitor.reads
         if name in write_arrays and offset is not None and offset < 0
     }
-    has_dependency = bool(carried_arrays)
+    scalar_recurrences = _scalar_recurrences(body)
+    scalar_variables = sorted({item["variable"] for item in scalar_recurrences})
+    has_scalar_dependency = bool(scalar_recurrences)
+    has_dependency = bool(carried_arrays) or has_scalar_dependency
     has_neighbor_access = any(
         offset is not None and offset != 0
         for _, offset in [*visitor.reads, *visitor.writes]
@@ -383,6 +428,10 @@ def _loop_memory_dependency_features(node: c_ast.Node) -> dict[str, Any]:
             "loop-carried read after previous write: "
             f"{', '.join(sorted(carried_arrays))}"
         )
+    if scalar_variables:
+        notes.append(
+            "scalar loop-carried recurrence: " + ", ".join(scalar_variables)
+        )
     if _has_variable_trip_count(node, iterator_name):
         notes.append("variable loop trip count")
     return {
@@ -392,11 +441,122 @@ def _loop_memory_dependency_features(node: c_ast.Node) -> dict[str, Any]:
         "has_neighbor_index_access": has_neighbor_access,
         "has_loop_carried_dependency": has_dependency,
         "dependency_arrays": sorted(carried_arrays),
+        "has_scalar_loop_carried_dependency": has_scalar_dependency,
+        "dependency_variables": scalar_variables,
+        "scalar_recurrences": scalar_recurrences,
         "has_variable_trip_count": _has_variable_trip_count(node, iterator_name),
         "pipeline_eligible": not has_dependency,
         "unroll_eligible": not has_dependency,
         "dependency_notes": notes,
     }
+
+
+class _ScalarRecurrenceVisitor(c_ast.NodeVisitor):
+    """Find direct scalar recurrence assignments inside one loop body."""
+
+    def __init__(self) -> None:
+        self.recurrences: list[dict[str, Any]] = []
+
+    def visit_For(self, node: c_ast.For) -> None:
+        return
+
+    def visit_While(self, node: c_ast.While) -> None:
+        return
+
+    def visit_DoWhile(self, node: c_ast.DoWhile) -> None:
+        return
+
+    def visit_Assignment(self, node: c_ast.Assignment) -> None:
+        if isinstance(node.lvalue, c_ast.ID):
+            variable = node.lvalue.name
+            operation = _assignment_recurrence_operation(node, variable)
+            if operation:
+                self._add(variable, operation, node.coord.line if node.coord else 0)
+        self.generic_visit(node)
+
+    def visit_If(self, node: c_ast.If) -> None:
+        recurrence = _conditional_extremum_recurrence(node)
+        if recurrence:
+            variable, operation, source_line = recurrence
+            self._add(variable, operation, source_line)
+        self.generic_visit(node)
+
+    def _add(self, variable: str, operation: str, source_line: int) -> None:
+        key = (variable, operation)
+        if any((item["variable"], item["operation"]) == key for item in self.recurrences):
+            return
+        self.recurrences.append(
+            {
+                "variable": variable,
+                "operation": operation,
+                "source_line": source_line,
+            }
+        )
+
+
+def _scalar_recurrences(node: c_ast.Node | None) -> list[dict[str, Any]]:
+    if node is None:
+        return []
+    visitor = _ScalarRecurrenceVisitor()
+    visitor.visit(node)
+    return visitor.recurrences
+
+
+def _assignment_recurrence_operation(
+    node: c_ast.Assignment,
+    variable: str,
+) -> str | None:
+    compound_operations = {
+        "+=": "add",
+        "-=": "subtract",
+        "*=": "multiply",
+        "/=": "divide",
+        "%=": "modulo",
+    }
+    if node.op in compound_operations:
+        return compound_operations[node.op]
+    if node.op != "=" or not _contains_node_key(node.rvalue, variable):
+        return None
+    if isinstance(node.rvalue, c_ast.BinaryOp):
+        return {
+            "+": "add",
+            "-": "subtract",
+            "*": "multiply",
+            "/": "divide",
+            "%": "modulo",
+        }.get(node.rvalue.op, "recurrence")
+    return "recurrence"
+
+
+def _conditional_extremum_recurrence(
+    node: c_ast.If,
+) -> tuple[str, str, int] | None:
+    condition = node.cond
+    if not isinstance(condition, c_ast.BinaryOp) or condition.op not in {">", "<"}:
+        return None
+    assignment = _single_assignment(node.iftrue)
+    if assignment is None or assignment.op != "=" or not isinstance(assignment.lvalue, c_ast.ID):
+        return None
+    variable = assignment.lvalue.name
+    assigned_key = _node_key(assignment.rvalue) if assignment.rvalue is not None else None
+    left_key = _node_key(condition.left)
+    right_key = _node_key(condition.right)
+    if right_key == variable and assigned_key == left_key:
+        operation = "max" if condition.op == ">" else "min"
+    elif left_key == variable and assigned_key == right_key:
+        operation = "min" if condition.op == ">" else "max"
+    else:
+        return None
+    return variable, operation, assignment.coord.line if assignment.coord else 0
+
+
+def _single_assignment(node: c_ast.Node | None) -> c_ast.Assignment | None:
+    if isinstance(node, c_ast.Assignment):
+        return node
+    if isinstance(node, c_ast.Compound) and len(node.block_items or []) == 1:
+        item = node.block_items[0]
+        return item if isinstance(item, c_ast.Assignment) else None
+    return None
 
 
 def _loop_iterator_name(node: c_ast.Node) -> str | None:

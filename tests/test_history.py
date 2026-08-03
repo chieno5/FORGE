@@ -9,6 +9,55 @@ from models import AnalysisReport
 
 
 class HistoryTests(unittest.TestCase):
+    def test_records_original_refactored_and_candidate_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = ForgeDatabase(Path(temp_dir) / "forge.db")
+            run = database.create_run(
+                "void reduction(void) {}",
+                "reduction_dot",
+                "reduction",
+                "context",
+            )
+            projects = [
+                {
+                    "record_key": "baseline", "kind": "baseline", "rank": None,
+                    "name": "Baseline", "design_role": "original_baseline",
+                    "pragmas": [], "transformation": None,
+                },
+                {
+                    "record_key": "refactored_baseline", "kind": "solution", "rank": None,
+                    "name": "Refactored Baseline", "design_role": "refactored_baseline",
+                    "pragmas": [], "transformation": {"name": "partial_accumulator_v1"},
+                },
+                {
+                    "record_key": "design_point_001", "kind": "solution", "rank": 1,
+                    "name": "Pipeline", "design_role": "candidate", "pragmas": [],
+                },
+            ]
+
+            ids = database.record_design_points(run.id, projects)
+            database.record_experiment(ids["baseline"], {"efficiency_score": 1.0}, "completed")
+            database.record_experiment(
+                ids["refactored_baseline"], {"efficiency_score": 1.2}, "completed"
+            )
+            database.record_experiment(
+                ids["design_point_001"], {"efficiency_score": 1.5}, "completed"
+            )
+            rows = database.connection.execute(
+                "SELECT id, design_role, parent_experiment_id, root_baseline_id, "
+                "efficiency_score FROM experiments ORDER BY id"
+            ).fetchall()
+
+            self.assertEqual(rows[0]["root_baseline_id"], rows[0]["id"])
+            self.assertEqual(rows[1]["parent_experiment_id"], rows[0]["id"])
+            self.assertEqual(rows[2]["parent_experiment_id"], rows[1]["id"])
+            self.assertTrue(all(row["root_baseline_id"] == rows[0]["id"] for row in rows))
+            self.assertAlmostEqual(
+                rows[2]["efficiency_score"] / rows[1]["efficiency_score"],
+                1.25,
+            )
+            database.close()
+
     def test_unclassified_source_uses_generic_history_group(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database = ForgeDatabase(Path(temp_dir) / "forge.db")

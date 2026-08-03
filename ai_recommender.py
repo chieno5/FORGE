@@ -162,6 +162,13 @@ The history may include earlier plans for the same source. Prefer unexplored des
 not treat a prior plan as forbidden: repeat it only when it is a useful verification or benchmark
 and explain that choice in the strategy and risk fields.
 The baseline_schedule contains the achieved HLS schedule when a baseline preflight was available.
+The source_preflight context reports structural constraints found in the original source and any
+controlled refactor already applied before this request. When applied is true, treat the supplied
+source_code and baseline_schedule as the refactored baseline; do not recreate or undo that source
+transformation. Recommend only pragmas that are legal for the supplied refactored source.
+Its testbench summary reports the frozen validation profile, case count, B0 oracle and known
+limits. Use this information when judging confidence, but do not claim that inferred cases prove
+all possible C inputs. Never change the top function interface to fit the testbench.
 Do not recommend a pragma that merely repeats an automatic baseline optimisation. Preserve an
 outer-loop or flattened-loop baseline schedule unless the proposed change has a concrete reason to
 improve total trip count, latency, or the energy-LUT product. Make the strategies meaningfully
