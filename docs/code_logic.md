@@ -130,6 +130,14 @@ SQLite uses one `experiments` table with one row per B0, B1, or candidate. `desi
 
 SQLite 使用一个统一的 `experiments` 表，每个 B0、B1 或 candidate 对应一行。`design_role`、`parent_experiment_id` 和 `root_baseline_id` 记录设计血缘：B1 指向 B0，B1 生效时 candidate 指向 B1。每行还保存源码、pragma plan、状态、错误、指标、得分、context key 和 batch 编号。
 
+SQLite does not have a separate datetime storage class. FORGE stores
+`created_at` and `updated_at` as ISO-8601 UTC text. This format keeps the time
+zone explicit and remains easy to sort and parse.
+
+SQLite 没有独立的 datetime 存储类型。FORGE 将 `created_at` 和
+`updated_at` 保存为 ISO-8601 UTC 文本。这种格式明确保留时区，
+并且便于排序和解析。
+
 FORGE first selects the highest-scored completed point in the current batch, then compares it with the historical best from the same exact context. A better historical project is used when its directory still exists. Baseline remains in the ranking, so it is selected when all candidates are worse. The final design is rerun, exported, and packaged as a ZIP file.
 
 FORGE 先选择当前 batch 中得分最高的已完成点，再将它与同一精确 context 中的历史最佳点比较。如果历史工程得分更高且目录仍存在，则使用历史最佳。Baseline 一直参与排名，因此当所有 candidate 都更差时，baseline 会被选中。最终设计会被重新运行、导出并打包为 ZIP 文件。

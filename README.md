@@ -162,7 +162,7 @@ python forge.py INPUT [--json FILE] [--verbose]
 | `--vitis-hls PATH` | config/auto | Vitis HLS executable override. |
 | `--vivado PATH` | config/auto | Vivado executable override. |
 | `--amd-root PATH` | config/auto | AMD tool root override. |
-| `--database FILE` | `forge.toml` or `data/forge_test_cPreflightFix.db` | Local SQLite database override. |
+| `--database FILE` | `forge.toml` or `data/forge_test.db` | Local SQLite database override. |
 
 ## Output
 
@@ -180,9 +180,9 @@ report/<source_name>_pragma_report.json
 
 ## Demo Database
 
-The current preflight-development database is
-`data/forge_test_cPreflightFix.db` by default. `forge_test.py` explicitly uses
-the separate legacy demo database `data/forge_test.db`.
+Normal FORGE runs and `forge_test.py` use `data/forge_test.db` by default. This
+is the active test and demonstration database. The formal experiment database
+is kept separately as `data/forge.db`.
 
 For a formal demonstration, change `[database].path` in `forge.toml` to
 `data/forge.db`, or override one command with:
@@ -326,6 +326,10 @@ ranking. Target FPGA part, target clock, and the measured HLS clock are stored
 separately. Per-point measurements are kept in SQLite; the pragma report contains
 the batch summary and the overall-best selection. When the current batch is
 worse, FORGE packages the historical exact-context best and reports that decision.
+
+SQLite has no separate datetime storage class. FORGE therefore stores
+`created_at` and `updated_at` as sortable ISO-8601 UTC text, for example
+`2026-08-06T18:56:15.361007+00:00`.
 
 Import the validated pragma exploration history into the unified experiment
 store:

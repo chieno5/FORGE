@@ -21,7 +21,85 @@ SUPPORTED_APPLICATIONS = frozenset((*APPLICATION_TABLES, "unclassified"))
 
 INITIAL_VALIDATED_SOURCE = "initial_validated"
 FORGE_RUN_SOURCE = "forge_run"
-UNIFIED_SCHEMA_VERSION = 3
+UNIFIED_SCHEMA_VERSION = 4
+EXPERIMENT_COLUMN_ORDER = (
+    "id",
+    "source_type",
+    "application",
+    "evaluation_context_key",
+    "experiment_set",
+    "batch_number",
+    "design_order",
+    "design_point",
+    "role",
+    "design_role",
+    "status",
+    "parent_experiment_id",
+    "root_baseline_id",
+    "original_source_hash",
+    "original_source_code",
+    "generated_source_code",
+    "transformation_json",
+    "top_function",
+    "pragma_plan_json",
+    "rationale",
+    "target_part",
+    "target_clock_period_ns",
+    "project_path",
+    "metrics_json",
+    "runtime_ns",
+    "performance",
+    "power_w",
+    "energy_nj",
+    "lut",
+    "efficiency_score",
+    "error",
+    "created_at",
+    "updated_at",
+)
+
+
+def _experiments_table_sql(table: str) -> str:
+    if table not in {"experiments", "experiments_reordered"}:
+        raise ValueError(f"Unsupported experiments table name: {table}")
+    return """
+        CREATE TABLE IF NOT EXISTS {table} (
+            id INTEGER PRIMARY KEY,
+            source_type TEXT NOT NULL,
+            application TEXT NOT NULL,
+            evaluation_context_key TEXT NOT NULL DEFAULT '',
+            experiment_set TEXT NOT NULL,
+            batch_number INTEGER,
+            design_order INTEGER NOT NULL DEFAULT 0,
+            design_point TEXT NOT NULL,
+            role TEXT NOT NULL,
+            design_role TEXT NOT NULL DEFAULT 'candidate',
+            status TEXT NOT NULL,
+            parent_experiment_id INTEGER,
+            root_baseline_id INTEGER,
+            original_source_hash TEXT NOT NULL,
+            original_source_code TEXT NOT NULL,
+            generated_source_code TEXT NOT NULL,
+            transformation_json TEXT NOT NULL DEFAULT '{}',
+            top_function TEXT NOT NULL DEFAULT '',
+            pragma_plan_json TEXT NOT NULL DEFAULT '{"pragmas": []}',
+            rationale TEXT,
+            target_part TEXT,
+            target_clock_period_ns REAL,
+            project_path TEXT,
+            metrics_json TEXT NOT NULL DEFAULT '{}',
+            runtime_ns REAL,
+            performance REAL,
+            power_w REAL,
+            energy_nj REAL,
+            lut INTEGER,
+            efficiency_score REAL,
+            error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(application, experiment_set, design_point)
+        )
+    """.replace("{table}", table)
 
 
 @dataclass
@@ -477,62 +555,62 @@ class ForgeDatabase:
         ).fetchone()
 
     def _create_schema(self) -> None:
+        self.connection.execute("PRAGMA foreign_keys = ON")
+        self.connection.execute(
+            "CREATE TABLE IF NOT EXISTS forge_schema (version INTEGER NOT NULL)"
+        )
+        self.connection.execute(_experiments_table_sql("experiments"))
+        self._ensure_unified_columns()
+        self._migrate_legacy_tables()
+        self._ensure_unified_columns()
+        self._reorder_unified_columns()
+        self._create_indexes()
+        self.connection.execute("DELETE FROM forge_schema")
+        self.connection.execute("INSERT INTO forge_schema(version) VALUES (?)", (UNIFIED_SCHEMA_VERSION,))
+        self.connection.commit()
+
+    def _reorder_unified_columns(self) -> None:
+        """Move lineage fields beside role/status without losing existing rows."""
+
+        current = [
+            str(row[1]) for row in self.connection.execute("PRAGMA table_info(experiments)")
+        ]
+        expected = list(EXPERIMENT_COLUMN_ORDER)
+        if current == expected:
+            return
+        missing = sorted(set(expected) - set(current))
+        extra = sorted(set(current) - set(expected))
+        if missing or extra:
+            raise RuntimeError(
+                "Cannot reorder experiments schema; "
+                f"missing columns={missing}, unexpected columns={extra}"
+            )
+
+        columns = ", ".join(EXPERIMENT_COLUMN_ORDER)
+        self.connection.execute("DROP TABLE IF EXISTS experiments_reordered")
+        self.connection.execute(_experiments_table_sql("experiments_reordered"))
+        self.connection.execute(
+            f"INSERT INTO experiments_reordered ({columns}) "
+            f"SELECT {columns} FROM experiments"
+        )
+        self.connection.execute("DROP TABLE experiments")
+        self.connection.execute(
+            "ALTER TABLE experiments_reordered RENAME TO experiments"
+        )
+
+    def _create_indexes(self) -> None:
         self.connection.executescript(
             """
-            PRAGMA foreign_keys = ON;
-            CREATE TABLE IF NOT EXISTS forge_schema (
-                version INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS experiments (
-                id INTEGER PRIMARY KEY,
-                source_type TEXT NOT NULL,
-                application TEXT NOT NULL,
-                evaluation_context_key TEXT NOT NULL DEFAULT '',
-                experiment_set TEXT NOT NULL,
-                batch_number INTEGER,
-                design_order INTEGER NOT NULL DEFAULT 0,
-                design_point TEXT NOT NULL,
-                role TEXT NOT NULL,
-                status TEXT NOT NULL,
-                design_role TEXT NOT NULL DEFAULT 'candidate',
-                parent_experiment_id INTEGER,
-                root_baseline_id INTEGER,
-                original_source_hash TEXT NOT NULL,
-                original_source_code TEXT NOT NULL,
-                generated_source_code TEXT NOT NULL,
-                top_function TEXT NOT NULL DEFAULT '',
-                pragma_plan_json TEXT NOT NULL DEFAULT '{"pragmas": []}',
-                transformation_json TEXT NOT NULL DEFAULT '{}',
-                rationale TEXT,
-                target_part TEXT,
-                target_clock_period_ns REAL,
-                project_path TEXT,
-                metrics_json TEXT NOT NULL DEFAULT '{}',
-                runtime_ns REAL,
-                performance REAL,
-                power_w REAL,
-                energy_nj REAL,
-                lut INTEGER,
-                efficiency_score REAL,
-                error TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                UNIQUE(application, experiment_set, design_point)
-            );
             CREATE INDEX IF NOT EXISTS idx_experiments_context
                 ON experiments(evaluation_context_key, status, efficiency_score DESC);
             CREATE INDEX IF NOT EXISTS idx_experiments_application
                 ON experiments(application, status, efficiency_score DESC);
             CREATE INDEX IF NOT EXISTS idx_experiments_source
                 ON experiments(original_source_hash, application);
+            CREATE INDEX IF NOT EXISTS idx_experiments_root
+                ON experiments(root_baseline_id, status, efficiency_score DESC);
             """
         )
-        self._ensure_unified_columns()
-        self._migrate_legacy_tables()
-        self._ensure_unified_columns()
-        self.connection.execute("DELETE FROM forge_schema")
-        self.connection.execute("INSERT INTO forge_schema(version) VALUES (?)", (UNIFIED_SCHEMA_VERSION,))
-        self.connection.commit()
 
     def _ensure_unified_columns(self) -> None:
         columns = {
@@ -784,4 +862,5 @@ def _row_value(row: sqlite3.Row, name: str) -> Any:
 
 
 def _now() -> str:
-    return datetime.now(UTC).isoformat()
+    # SQLite has no separate datetime storage class; keep sortable ISO-8601 UTC text.
+    return datetime.now(UTC).isoformat(timespec="microseconds")

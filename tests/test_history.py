@@ -1,14 +1,111 @@
 import tempfile
 import unittest
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 from application_classifier import classify_application
-from forge_database import ForgeDatabase, build_evaluation_context_key
+from forge_database import (
+    EXPERIMENT_COLUMN_ORDER,
+    UNIFIED_SCHEMA_VERSION,
+    ForgeDatabase,
+    build_evaluation_context_key,
+)
 from models import AnalysisReport
 
 
 class HistoryTests(unittest.TestCase):
+    def test_schema_orders_lineage_fields_and_uses_iso_utc_times(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = ForgeDatabase(Path(temp_dir) / "forge.db")
+            run = database.create_run(
+                "void kernel(void) {}", "unclassified", "kernel", "context"
+            )
+            database.record_design_points(
+                run.id,
+                [{
+                    "record_key": "baseline",
+                    "kind": "baseline",
+                    "name": "Baseline",
+                    "design_role": "original_baseline",
+                    "pragmas": [],
+                }],
+            )
+
+            columns = [
+                row[1] for row in database.connection.execute(
+                    "PRAGMA table_info(experiments)"
+                )
+            ]
+            row = database.connection.execute(
+                "SELECT created_at, updated_at FROM experiments"
+            ).fetchone()
+            version = database.connection.execute(
+                "SELECT version FROM forge_schema"
+            ).fetchone()[0]
+
+            self.assertEqual(columns, list(EXPERIMENT_COLUMN_ORDER))
+            self.assertEqual(version, UNIFIED_SCHEMA_VERSION)
+            self.assertEqual(datetime.fromisoformat(row["created_at"]).utcoffset().total_seconds(), 0)
+            self.assertEqual(datetime.fromisoformat(row["updated_at"]).utcoffset().total_seconds(), 0)
+            database.close()
+
+    def test_reorders_v3_schema_without_losing_experiments(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "forge.db"
+            database = ForgeDatabase(path)
+            run = database.create_run(
+                "void kernel(void) {}", "unclassified", "kernel", "context"
+            )
+            point_id = database.record_design_points(
+                run.id,
+                [{
+                    "record_key": "baseline",
+                    "kind": "baseline",
+                    "name": "Baseline",
+                    "design_role": "original_baseline",
+                    "pragmas": [],
+                }],
+            )["baseline"]
+            database.close()
+
+            lineage_tail = [
+                "design_role",
+                "parent_experiment_id",
+                "root_baseline_id",
+                "transformation_json",
+            ]
+            old_order = [
+                column for column in EXPERIMENT_COLUMN_ORDER
+                if column not in lineage_tail
+            ] + lineage_tail
+            columns = ", ".join(old_order)
+            connection = sqlite3.connect(path)
+            connection.execute("ALTER TABLE experiments RENAME TO experiments_current")
+            connection.execute(
+                f"CREATE TABLE experiments AS SELECT {columns} FROM experiments_current"
+            )
+            connection.execute("DROP TABLE experiments_current")
+            connection.execute("UPDATE forge_schema SET version = 3")
+            connection.commit()
+            connection.close()
+
+            migrated = ForgeDatabase(path)
+            migrated_columns = [
+                row[1] for row in migrated.connection.execute(
+                    "PRAGMA table_info(experiments)"
+                )
+            ]
+            row = migrated.connection.execute(
+                "SELECT id, design_role, root_baseline_id FROM experiments"
+            ).fetchone()
+
+            self.assertEqual(migrated_columns, list(EXPERIMENT_COLUMN_ORDER))
+            self.assertEqual(row["id"], point_id)
+            self.assertEqual(row["design_role"], "original_baseline")
+            self.assertEqual(row["root_baseline_id"], point_id)
+            migrated.close()
+
     def test_records_original_refactored_and_candidate_lineage(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database = ForgeDatabase(Path(temp_dir) / "forge.db")
