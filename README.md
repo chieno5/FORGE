@@ -6,24 +6,33 @@ FORGE is a Python command-line tool for Vitis HLS design-space exploration. It
 analyzes C code, requests pragma design points, generates HLS projects, runs
 Vitis HLS and Vivado when configured, then selects the best measured option.
 
-The current optimization objective is fixed: explore candidates that can later be
-ranked by **energy-LUT efficiency** after Vitis reports are available. The main
-metric is `efficiency_score = (baseline_energy * baseline_LUT) /
-(candidate_energy * candidate_LUT)`.
+The optimization objective is fixed: rank every valid design by **energy-LUT
+efficiency** after Vitis evaluation. The original source baseline B0 is the
+common reference:
+
+```text
+efficiency_score = (B0_energy * B0_LUT) / (design_energy * design_LUT)
+```
+
+B0 has score `1.0`. A refactored baseline B1 and every pragma candidate are also
+scored against B0, so all source versions remain directly comparable.
 
 ## Workflow
 
 ```text
 C source
   -> static parsing and feature extraction
-  -> function and loop scoring
+  -> function and loop scoring plus structural-limit detection
   -> optional static JSON report
+  -> freeze one user or automatic testbench
+  -> optional controlled reduction source preflight (B0 -> B1)
   -> application classification and matching SQLite history
+  -> baseline HLS preflight and achieved schedule
   -> AI recommendation for N energy-LUT design points
-  -> baseline plus N Vitis HLS solution folders
-  -> optional supplied or locally generated coverage testbench
+  -> targeted repair of rejected or repeated recommendation ranks
+  -> B0, optional B1, and N Vitis HLS candidate components
   -> Vitis HLS, Vivado power estimation and report parsing
-  -> efficiency_score ranking and final Vitis package
+  -> B0-based efficiency_score and overall-best package
 ```
 
 ## Installation
@@ -109,12 +118,16 @@ Generate 10 design points, run the complete local flow, and package the best one
 python forge.py examples/vision_pipeline.c --generate --design-points 10 --top inspect_frame --auto-testbench --run-vitis
 ```
 
+For classified reduction/dot code, `--generate` also enables the controlled
+source preflight described below. It does not need a separate command option.
+
 ## Command
 
 ```text
 python forge.py INPUT [--json FILE] [--verbose]
                       [--ai] [--generate] [--model MODEL]
-                      [--design-points N] [--run-vitis] [--tool-timeout SECONDS]
+                      [--design-points N] [--exploration-mode explore|verify]
+                      [--run-vitis] [--tool-timeout SECONDS]
                       [--top FUNCTION] [--output-root DIR]
                       [--part PART] [--clock NS]
                       [--testbench FILE | --auto-testbench]
@@ -149,7 +162,7 @@ python forge.py INPUT [--json FILE] [--verbose]
 | `--vitis-hls PATH` | config/auto | Vitis HLS executable override. |
 | `--vivado PATH` | config/auto | Vivado executable override. |
 | `--amd-root PATH` | config/auto | AMD tool root override. |
-| `--database FILE` | `forge.toml` | Local SQLite database override. |
+| `--database FILE` | `forge.toml` or `data/forge_test_cPreflightFix.db` | Local SQLite database override. |
 
 ## Output
 
@@ -167,24 +180,26 @@ report/<source_name>_pragma_report.json
 
 ## Demo Database
 
-During the demo stage, normal FORGE runs use `data/forge_test.db` by default.
-`forge_test.py` remains available as an equivalent explicit entry point.
+The current preflight-development database is
+`data/forge_test_cPreflightFix.db` by default. `forge_test.py` explicitly uses
+the separate legacy demo database `data/forge_test.db`.
 
 For a formal demonstration, change `[database].path` in `forge.toml` to
 `data/forge.db`, or override one command with:
 
 ```powershell
-forge examples/fir_filter_example.c --database data/forge.db
+python forge.py examples/fir_filter_example.c --database data/forge.db
 ```
 
 Generated Vitis folders:
 
 ```text
 generated/<source_name>/
-  baseline/
-  solution_01_<solution_name>/
-  solution_02_<solution_name>/
-  solution_03_<solution_name>/
+  batch01_baseline/
+  batch01_refactored_baseline/  # only when B1 is accepted
+  batch01_dp01_<solution_name>/
+  batch01_dp02_<solution_name>/
+  ...
 ```
 
 Each generated option contains:
@@ -212,6 +227,25 @@ coordinated pragma set. If the input source contains a non-top `main` function,
 FORGE removes it from the synthesis source because `main` belongs in the
 testbench.
 
+## Source Preflight
+
+Static analysis reports scalar loop-carried recurrences as structural
+constraints and includes them in the AI context. For a classified reduction/dot
+application, FORGE may apply the controlled `partial_accumulator_v1` rewrite to
+an integer add, minimum, or maximum reduction. It replaces one shared
+accumulator with a partitioned partial-accumulator array while keeping the top
+function interface unchanged.
+
+The original source is B0 and the rewritten source is B1. FORGE reparses B1 and
+checks that its top interface still matches B0. With `--run-vitis`, B1 must also
+pass HLS and the same frozen testbench used by B0 and every candidate. If any
+check fails, FORGE rejects B1 and returns to B0. In generation-only mode, B1 has
+parse and interface checks but not the full HLS/testbench preflight.
+
+Candidates are generated from B1 only after B1 is accepted. Database lineage
+records B1 as a child of B0 and candidates as children of their active baseline,
+while the single final score still uses B0 as its common reference.
+
 When `--run-vitis` is used, FORGE first synthesizes the baseline and adds its
 achieved schedule to the AI context. Each project receives execution logs, HLS
 reports, and a Vivado `power_report.rpt`. FORGE writes the final ranking to the
@@ -237,8 +271,9 @@ files. The generator accepts a controlled set of directives, including validated
 `BIND_STORAGE` and function-level `DATAFLOW`; unsupported directives such as
 generated `INTERFACE` changes are rejected before source generation. Unsafe AI
 recommendations that pipeline non-innermost loops are also rejected. FORGE
-identifies loop-carried array dependencies during static analysis and does not
-allow direct `PIPELINE` or `UNROLL` recommendations for those loops.
+identifies known loop-carried array or scalar dependencies during static analysis
+and does not allow direct `PIPELINE` or `UNROLL` recommendations for restricted
+loops.
 After `csynth`, FORGE verifies generated pragmas against the HLS report and log.
 An ignored pragma or a pipeline that did not create its target loop is marked
 `invalid`, skipped for power estimation, and excluded from efficiency ranking.
@@ -257,12 +292,13 @@ random cases. Every case calls both the reference and the DUT, then checks the r
 value and all array or pointer parameters. The generated manifest records the exact
 profile, seed, cases, inferred parameter directions, oracle, and known limits.
 
-The testbench is generated once and frozen. B0, a refactored B1, and every pragma
-candidate receive the same files and identity. This keeps validation and scores
-comparable. The automatic inference cannot discover every legal input contract,
-pointer alias rule, global side effect, file input, or hardware protocol. Use a
-user testbench when these details matter; `full` means broad generated coverage,
-not a mathematical proof over every possible C input.
+The testbench is generated once, before source preflight, and then frozen. B0,
+a refactored B1, and every pragma candidate receive the same files and identity.
+This keeps validation and scores comparable. The automatic inference cannot
+discover every legal input contract, pointer alias rule, global side effect,
+file input, or hardware protocol. Use a user testbench when these details
+matter; `full` means broad generated coverage, not a mathematical proof over
+every possible C input.
 
 ## Application History
 
@@ -283,13 +319,13 @@ explicit verification of the historical incumbent. Different source code or
 evaluation configuration starts a separate exploration context.
 
 Each experiment row includes the original and generated C source, an
-`experiment_set` for one FORGE run, and `design_order` for baseline and
-design-point display order. Invalid runs are retained for diagnosis but are not
-sent to AI history or included in efficiency ranking. Target FPGA part, target
-clock, and the measured HLS clock are stored separately. Per-point measurements
-are kept in SQLite; the pragma report contains the batch summary and the
-overall-best selection. When the current batch is worse, FORGE packages the
-historical overall best and reports that decision.
+`experiment_set` for one FORGE run, `design_order`, `design_role`, parent/root
+baseline IDs, and optional source-transformation metadata. Invalid runs are
+retained as exact-context negative experience but are excluded from efficiency
+ranking. Target FPGA part, target clock, and the measured HLS clock are stored
+separately. Per-point measurements are kept in SQLite; the pragma report contains
+the batch summary and the overall-best selection. When the current batch is
+worse, FORGE packages the historical exact-context best and reports that decision.
 
 Import the validated pragma exploration history into the unified experiment
 store:
