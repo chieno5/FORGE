@@ -95,7 +95,12 @@ class VitisGeneratorTests(unittest.TestCase):
                 self.assertFalse((Path(project.directory) / "tb").exists())
                 tcl = Path(project.tcl_script).read_text(encoding="utf-8")
                 self.assertIn("cd $workspace_dir", tcl)
-                self.assertIn(f"open_component -reset {project.component_name}", tcl)
+                self.assertIn(
+                    f"open_component -reset [file join $workspace_dir "
+                    f"{{{project.component_name}}}]",
+                    tcl,
+                )
+                self.assertIn("set script_dir [file dirname [info script]]", tcl)
                 self.assertNotIn("open_project", tcl)
                 self.assertNotIn("open_solution", tcl)
                 self.assertNotIn("csim_design", tcl)

@@ -308,6 +308,77 @@ class HistoryTests(unittest.TestCase):
             self.assertEqual(second["current_source_plans"], [])
             database.close()
 
+    def test_exposes_same_source_other_context_as_replay_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = ForgeDatabase(Path(temp_dir) / "forge.db")
+            source = (
+                "void kernel(int input[16], int output[16]) { "
+                "for (int i=0;i<16;i++) output[i]=input[i]; }"
+            )
+            old_context = build_evaluation_context_key(
+                source, "kernel", "part", 10.0, "old-smoke"
+            )
+            new_context = build_evaluation_context_key(
+                source, "kernel", "part", 10.0, "full-frozen"
+            )
+            run = database.create_run(source, "fir_filter", "kernel", old_context)
+            point_id = database.record_design_points(run.id, [{
+                "kind": "solution",
+                "rank": 1,
+                "name": "old_winner",
+                "pragmas": [
+                    {"target_function": "kernel", "target_loop_id": "kernel.loop_1", "pragma": "#pragma HLS PIPELINE II=1"},
+                    {"target_function": "kernel", "target_loop_id": "", "pragma": "#pragma HLS ARRAY_PARTITION variable=input cyclic factor=2 dim=1"},
+                ],
+                "directory": "project",
+            }])["design_point_001"]
+            database.record_experiment(point_id, {"efficiency_score": 1.4}, "completed")
+
+            context = database.history_context(
+                "fir_filter", source, evaluation_context_key=new_context
+            )
+
+            self.assertEqual(context["current_source_plans"], [])
+            self.assertEqual(context["historical_replay_candidates"][0]["name"], "old_winner")
+            self.assertEqual(
+                context["historical_replay_candidates"][0]["evaluation_context_key"],
+                old_context,
+            )
+            database.close()
+
+    def test_backfills_recoverable_legacy_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "forge.db"
+            database = ForgeDatabase(path)
+            database.import_historical_records(
+                "matrix_multiply",
+                "legacy",
+                [{
+                    "design_point": "baseline",
+                    "role": "baseline",
+                    "source_code": "void matrix_multiply(int a[4]) { a[0] = 1; }",
+                    "runtime_s": 2e-9,
+                    "power_w": 0.5,
+                    "lut": 10,
+                    "efficiency_score": 1.0,
+                }],
+            )
+            database.connection.execute(
+                "UPDATE experiments SET top_function='', performance=NULL, energy_nj=NULL"
+            )
+            database.connection.commit()
+            database.close()
+
+            reopened = ForgeDatabase(path)
+            row = reopened.connection.execute(
+                "SELECT top_function, runtime_ns, performance, energy_nj FROM experiments"
+            ).fetchone()
+
+            self.assertEqual(row["top_function"], "matrix_multiply")
+            self.assertAlmostEqual(row["performance"], 1.0 / row["runtime_ns"])
+            self.assertAlmostEqual(row["energy_nj"], row["runtime_ns"] * 0.5)
+            reopened.close()
+
     def test_invalid_experiment_is_retained_but_not_sent_to_ai_history(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database = ForgeDatabase(Path(temp_dir) / "forge.db")

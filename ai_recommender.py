@@ -156,8 +156,9 @@ allocation_allowed_functions, with no loop target and exactly `operation instanc
 where N is 1, 2 or 4. ALLOCATION is a resource-sharing alternative: use it in at most one
 solution in a batch, and do not use it when lower-risk loop or memory options are sufficient.
 The input contains pipeline_allowed_loop_ids and unroll_allowed_loop_ids. Use PIPELINE or UNROLL
-only on the corresponding exact loop IDs. Do not apply either directive to a loop marked with a
-loop-carried dependency; recommend a refactor-oriented function-level alternative instead.
+only on the corresponding exact loop IDs. Never PIPELINE a loop marked with a loop-carried
+dependency. A bounded factor-2 or factor-4 UNROLL is allowed only when that loop is listed in
+bounded_reduction_unroll_loop_ids; every generated point is still gated by the frozen testbench.
 The history may include earlier plans for the same source. Prefer unexplored design points, but do
 not treat a prior plan as forbidden: repeat it only when it is a useful verification or benchmark
 and explain that choice in the strategy and risk fields.
@@ -166,6 +167,8 @@ The source_preflight context reports structural constraints found in the origina
 controlled refactor already applied before this request. When applied is true, treat the supplied
 source_code and baseline_schedule as the refactored baseline; do not recreate or undo that source
 transformation. Recommend only pragmas that are legal for the supplied refactored source.
+Identifiers containing `__forge_` are internal products of that controlled refactor. Never target
+them with a pragma: their required implementation directives are already emitted by FORGE.
 Its testbench summary reports the frozen validation profile, case count, B0 oracle and known
 limits. Use this information when judging confidence, but do not claim that inferred cases prove
 all possible C inputs. Never change the top function interface to fit the testbench.
@@ -189,6 +192,29 @@ def recommend_solutions(
     exploration_mode: str = "explore",
 ) -> AIRecommendationResult:
     selected_model = model or DEFAULT_MODEL
+    if design_point_count < 1:
+        raise AIRecommendationError("design_point_count must be at least 1.")
+    if exploration_mode not in {"explore", "verify"}:
+        raise AIRecommendationError("exploration_mode must be 'explore' or 'verify'.")
+
+    historical_replay = _historical_replay_solution(
+        experience_context,
+        report,
+        top_function,
+        source_text,
+    )
+    if historical_replay is not None:
+        historical_replay = _rerank_solution(historical_replay, 1)
+        if design_point_count == 1:
+            return AIRecommendationResult(
+                model=selected_model,
+                summary=(
+                    "Re-running the strongest compatible same-source historical pragma plan "
+                    "under the current frozen testbench and evaluation context."
+                ),
+                solutions=[historical_replay],
+            )
+
     if client is None:
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
@@ -202,11 +228,6 @@ def recommend_solutions(
                 "The openai package is missing. Run: pip install -r requirements.txt"
             ) from exc
         client = OpenAI(api_key=api_key)
-
-    if design_point_count < 1:
-        raise AIRecommendationError("design_point_count must be at least 1.")
-    if exploration_mode not in {"explore", "verify"}:
-        raise AIRecommendationError("exploration_mode must be 'explore' or 'verify'.")
 
     request_payload = _build_request_payload(
         report=report,
@@ -222,17 +243,30 @@ def recommend_solutions(
     correction: str | None = None
     exploration_state = (experience_context or {}).get("exploration_state", {})
     converged = bool(exploration_state.get("converged"))
-    accepted: dict[int, OptimizationSolution] = {}
-    repair_slots: list[int] = []
+    accepted: dict[int, OptimizationSolution] = (
+        {1: historical_replay} if historical_replay is not None else {}
+    )
+    repair_slots: list[int] = (
+        list(range(2, design_point_count + 1)) if historical_replay is not None else []
+    )
     rejected_for_repair: list[dict[str, Any]] = []
     for attempt in range(1, MAX_RECOMMENDATION_ATTEMPTS + 1):
+        replay_prefill_mode = bool(repair_slots and not rejected_for_repair and historical_replay)
         repair_mode = bool(repair_slots)
         requested_count = len(repair_slots) if repair_mode else design_point_count
         instructions = (
             f"{SYSTEM_PROMPT}\nReturn exactly {requested_count} solutions, "
             f"ranked consecutively from 1 to {requested_count}."
         )
-        if repair_mode:
+        if replay_prefill_mode:
+            instructions += (
+                "\nFORGE has reserved original rank 1 for a same-source historical plan that "
+                "must be re-measured under the current frozen testbench. Keep the solution in "
+                "repair_context.accepted_solutions unchanged. Return new solutions only for "
+                f"original ranks {repair_slots}, in that order, using temporary consecutive "
+                f"ranks 1 through {requested_count}. Do not repeat the reserved plan."
+            )
+        elif repair_mode:
             instructions += (
                 "\nThis is a targeted repair request. Keep every solution listed in "
                 "repair_context.accepted_solutions unchanged. Return replacements only for "
@@ -263,7 +297,9 @@ def recommend_solutions(
                 "state that expected improvement is low."
             )
         if correction:
-            if repair_mode:
+            if replay_prefill_mode:
+                pass
+            elif repair_mode:
                 instructions += (
                     "\nThe previous targeted replacement failed FORGE validation:\n"
                     f"{correction}\nRepair only the requested replacement ranks."
@@ -373,11 +409,15 @@ def recommend_solutions(
         except Exception as exc:
             correction = f"OpenAI request failed: {exc}"
         else:
+            replay_prefix = (
+                "Reserved one compatible same-source historical plan for current-context "
+                "revalidation. " if historical_replay is not None else ""
+            )
             return AIRecommendationResult(
                 model=selected_model,
                 # A rejected response must not leak into the final explanation.
                 # In repair mode this is the summary of the accepted replacement only.
-                summary=summary,
+                summary=replay_prefix + summary,
                 solutions=[accepted[rank] for rank in sorted(accepted)],
             )
 
@@ -405,9 +445,13 @@ def recommend_solutions(
         kept = len(accepted)
         for solution, original_rank in zip(fallback.solutions, missing):
             accepted[original_rank] = _rerank_solution(solution, original_rank)
+        replay_prefix = (
+            "Reserved one compatible same-source historical plan for current-context "
+            "revalidation. " if historical_replay is not None else ""
+        )
         return AIRecommendationResult(
             model=selected_model,
-            summary=(
+            summary=replay_prefix + (
                 f"Kept {kept} validated AI design point(s). " if kept else ""
             ) + fallback.summary,
             solutions=[accepted[rank] for rank in sorted(accepted)],
@@ -507,7 +551,7 @@ def _build_request_payload(
     local_arrays = _local_array_names_by_function(
         source_text, {function.name: function for function in report.functions}
     )
-    parameter_arrays = _array_parameter_names(report)
+    parameter_arrays = _partitionable_array_parameter_names(report)
     allowed_arrays = {
         name: sorted(set(parameter_arrays.get(name, [])) | set(local_arrays.get(name, [])))
         for name in {**parameter_arrays, **local_arrays}
@@ -526,6 +570,7 @@ def _build_request_payload(
             "automatic_directives": sorted(AUTO_GENERATION_DIRECTIVES),
             "pipeline_allowed_loop_ids": _pipeline_allowed_loop_ids(report),
             "unroll_allowed_loop_ids": _unroll_allowed_loop_ids(report),
+            "bounded_reduction_unroll_loop_ids": _bounded_reduction_unroll_loop_ids(report),
             "dependency_restricted_loop_ids": _dependency_restricted_loop_ids(report),
             "array_partition_allowed_variables": allowed_arrays,
             "array_reshape_allowed_variables": allowed_arrays,
@@ -536,6 +581,10 @@ def _build_request_payload(
                 "ARRAY_PARTITION complete is not allowed.",
                 "ARRAY_RESHAPE complete is not allowed.",
             ],
+            "reserved_generated_identifier_rule": (
+                "Never target an identifier containing __forge_; FORGE already emits the "
+                "required directives for its generated preflight state."
+            ),
         },
     }
     if experience_context:
@@ -649,11 +698,12 @@ def _validate_directive(
         if not directive.target_loop_id:
             raise AIRecommendationError("UNROLL must target an analyzed loop, not a function.")
         loop = next(region for region in target.loop_regions if region.id == directive.target_loop_id)
-        if not loop.features.get("unroll_eligible", True):
+        factor = _pragma_integer_option(directive.pragma, "factor")
+        reduction_unroll = _is_bounded_reduction_unroll(loop, factor)
+        if not loop.features.get("unroll_eligible", True) and not reduction_unroll:
             raise AIRecommendationError(
                 f"UNROLL target has a loop-carried dependency: {directive.target_loop_id}"
             )
-        factor = _pragma_integer_option(directive.pragma, "factor")
         has_factor = re.search(
             r"\bfactor\s*=", directive.pragma, flags=re.IGNORECASE
         )
@@ -681,6 +731,11 @@ def _validate_directive(
             raise AIRecommendationError(f"{name} must use bounded cyclic or block style.")
         if factor not in {2, 4, 8} or dim != 1:
             raise AIRecommendationError(f"{name} requires factor 2, 4 or 8 and dim=1.")
+        extent = _array_parameter_extent(target, variable) if variable in array_parameters else None
+        if extent is not None and factor is not None and factor > extent:
+            raise AIRecommendationError(
+                f"{name} factor {factor} exceeds the declared dim=1 extent {extent}: {variable}"
+            )
     if name == "BIND_STORAGE":
         variable = _pragma_option(directive.pragma, "variable")
         storage_type = _pragma_option(directive.pragma, "type")
@@ -787,9 +842,32 @@ def _unroll_allowed_loop_ids(report: AnalysisReport) -> dict[str, list[str]]:
             loop.id
             for loop in function.loop_regions
             if loop.features.get("unroll_eligible", True)
+            or _supports_bounded_reduction_unroll(loop)
         ]
         for function in report.functions
     }
+
+
+def _bounded_reduction_unroll_loop_ids(report: AnalysisReport) -> dict[str, list[str]]:
+    return {
+        function.name: [
+            loop.id for loop in function.loop_regions
+            if _supports_bounded_reduction_unroll(loop)
+        ]
+        for function in report.functions
+    }
+
+
+def _supports_bounded_reduction_unroll(loop: Any) -> bool:
+    recurrences = loop.features.get("scalar_recurrences", [])
+    return bool(recurrences) and all(
+        str(item.get("operation")) in {"add", "max", "min"}
+        for item in recurrences
+    ) and not loop.features.get("dependency_arrays", [])
+
+
+def _is_bounded_reduction_unroll(loop: Any, factor: int | None) -> bool:
+    return factor in {2, 4} and _supports_bounded_reduction_unroll(loop)
 
 
 def _dependency_restricted_loop_ids(report: AnalysisReport) -> dict[str, list[str]]:
@@ -810,6 +888,17 @@ def _array_parameter_names(report: AnalysisReport) -> dict[str, list[str]]:
     }
 
 
+def _partitionable_array_parameter_names(report: AnalysisReport) -> dict[str, list[str]]:
+    return {
+        function.name: [
+            name
+            for name in _array_parameter_names_for_function(function)
+            if (extent := _array_parameter_extent(function, name)) is None or extent >= 2
+        ]
+        for function in report.functions
+    }
+
+
 def _array_parameter_names_for_function(function: Any) -> list[str]:
     return [
         name
@@ -817,6 +906,23 @@ def _array_parameter_names_for_function(function: Any) -> list[str]:
         if (name := _parameter_name(parameter))
         and ("[" in parameter or "*" in parameter)
     ]
+
+
+def _array_parameter_extent(function: Any, variable: str) -> int | None:
+    for parameter in function.parameters:
+        if _parameter_name(parameter) != variable:
+            continue
+        match = re.search(
+            rf"\b{re.escape(variable)}\s*\[\s*(\d+)\s*\]",
+            parameter,
+        )
+        if match is None:
+            match = re.search(
+                rf"\[\s*(\d+)\s*\]\s*\b{re.escape(variable)}\b",
+                parameter,
+            )
+        return int(match.group(1)) if match else None
+    return None
 
 
 def _allocation_allowed_functions(report: AnalysisReport) -> list[str]:
@@ -899,7 +1005,7 @@ def _fallback_recommendations(
     arrays = [
         (function_name, array_name)
         for function_name in reachable_names
-        for array_name in _array_parameter_names(report).get(function_name, [])
+        for array_name in _partitionable_array_parameter_names(report).get(function_name, [])
     ]
     primary_options: list[tuple[str, PragmaDirective]] = []
     for loop_id in pipeline_loops:
@@ -932,7 +1038,7 @@ def _fallback_recommendations(
         )
         for function_name, array_name in arrays
         for partition_type in ("cyclic", "block")
-        for factor in (2, 4, 8)
+        for factor in _fallback_partition_factors(report, function_name)
     ]
     hierarchy = PragmaDirective(
         top_function,
@@ -994,6 +1100,32 @@ def _fallback_recommendations(
     )
 
 
+def _fallback_partition_factors(
+    report: AnalysisReport,
+    function_name: str,
+) -> tuple[int, int, int]:
+    """Order safe bank factors from the analyzed per-iteration memory demand."""
+
+    function = next(
+        (item for item in report.functions if item.name == function_name),
+        None,
+    )
+    if function is None:
+        return (2, 4, 8)
+    peak_accesses = max(
+        (
+            int(loop.features.get("array_access_count", 0) or 0)
+            for loop in function.loop_regions
+        ),
+        default=0,
+    )
+    if peak_accesses >= 8:
+        return (8, 4, 2)
+    if peak_accesses >= 4:
+        return (4, 2, 8)
+    return (2, 4, 8)
+
+
 def _loop_function_name(loop_id: str) -> str:
     return loop_id.rsplit(".loop_", 1)[0]
 
@@ -1029,6 +1161,62 @@ def _is_explicit_verification(solution: OptimizationSolution) -> bool:
         marker in description
         for marker in ("verification", "verify", "benchmark", "re-measure", "remeasure", "retest")
     )
+
+
+def _historical_replay_solution(
+    experience_context: dict[str, Any] | None,
+    report: AnalysisReport,
+    top_function: str,
+    source_text: str | None,
+) -> OptimizationSolution | None:
+    """Return the best structured same-source plan that still validates today."""
+
+    context = experience_context or {}
+    current_signatures = _previous_plan_signatures(context)
+    for item in context.get("historical_replay_candidates", []):
+        if not isinstance(item, dict):
+            continue
+        pragmas = item.get("pragmas")
+        if not isinstance(pragmas, list) or not 2 <= len(pragmas) <= 4:
+            continue
+        if not all(isinstance(pragma, dict) for pragma in pragmas):
+            continue
+        if _pragma_plan_signature(pragmas) in current_signatures:
+            continue
+        plan = item.get("pragma_plan") if isinstance(item.get("pragma_plan"), dict) else {}
+        strategy = str(plan.get("strategy") or item.get("rationale") or "").strip()
+        raw = {
+            "summary": "",
+            "solutions": [{
+                "rank": 1,
+                "name": f"historical_replay_{item.get('name') or 'validated_plan'}",
+                "strategy": (
+                    "Revalidate a compatible same-source historical plan under the current "
+                    "frozen testbench. " + strategy
+                ).strip(),
+                "expected_effect": (
+                    "Confirms whether the previously measured energy-LUT improvement remains "
+                    "valid in the current toolchain and testbench context."
+                ),
+                "risk": (
+                    "Historical metrics are advisory only; this point must pass current csim, "
+                    "cosim, pragma validation and scoring before it can become the incumbent."
+                ),
+                "confidence": 0.8,
+                "pragmas": pragmas,
+            }],
+        }
+        try:
+            return parse_solution_payload(
+                raw,
+                report,
+                top_function,
+                design_point_count=1,
+                source_text=source_text,
+            )[0]
+        except AIRecommendationError:
+            continue
+    return None
 
 
 def _pragma_plan_signature(pragmas: list[Any]) -> tuple[tuple[str, str, str], ...]:

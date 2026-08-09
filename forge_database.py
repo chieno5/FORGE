@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -21,7 +22,7 @@ SUPPORTED_APPLICATIONS = frozenset((*APPLICATION_TABLES, "unclassified"))
 
 INITIAL_VALIDATED_SOURCE = "initial_validated"
 FORGE_RUN_SOURCE = "forge_run"
-UNIFIED_SCHEMA_VERSION = 4
+UNIFIED_SCHEMA_VERSION = 5
 EXPERIMENT_COLUMN_ORDER = (
     "id",
     "source_type",
@@ -325,18 +326,31 @@ class ForgeDatabase:
         limit: int = 20,
     ) -> dict[str, Any]:
         _validate_application(application)
-        rows = self.connection.execute(
-            """
-            SELECT * FROM experiments
-            WHERE application = ? AND status = 'completed' AND efficiency_score IS NOT NULL
-            ORDER BY efficiency_score DESC, updated_at DESC LIMIT ?
-            """,
-            (application, limit),
-        ).fetchall()
         source_hash = (
             hashlib.sha256(source_text.encode("utf-8")).hexdigest()
             if source_text is not None else None
         )
+        if source_hash:
+            rows = self.connection.execute(
+                """
+                SELECT * FROM experiments
+                WHERE application = ? AND status = 'completed'
+                  AND efficiency_score IS NOT NULL
+                ORDER BY CASE WHEN original_source_hash = ? THEN 0 ELSE 1 END,
+                         efficiency_score DESC, updated_at DESC LIMIT ?
+                """,
+                (application, source_hash, limit),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                """
+                SELECT * FROM experiments
+                WHERE application = ? AND status = 'completed'
+                  AND efficiency_score IS NOT NULL
+                ORDER BY efficiency_score DESC, updated_at DESC LIMIT ?
+                """,
+                (application, limit),
+            ).fetchall()
         current_rows: list[sqlite3.Row] = []
         if evaluation_context_key:
             current_rows = self.connection.execute(
@@ -366,6 +380,24 @@ class ForgeDatabase:
         ]
         baseline_score = float(baseline["efficiency_score"]) if baseline else None
         state = self.exploration_state(application, evaluation_context_key, source_hash)
+        replay_rows: list[sqlite3.Row] = []
+        if source_hash:
+            replay_rows = self.connection.execute(
+                """
+                SELECT * FROM experiments
+                WHERE application = ? AND original_source_hash = ?
+                  AND status = 'completed' AND role != 'baseline'
+                  AND efficiency_score IS NOT NULL
+                  AND (? = '' OR evaluation_context_key != ?)
+                ORDER BY efficiency_score DESC, updated_at DESC LIMIT 20
+                """,
+                (
+                    application,
+                    source_hash,
+                    evaluation_context_key or "",
+                    evaluation_context_key or "",
+                ),
+            ).fetchall()
         schedule = None
         if baseline:
             schedule = _json_object(baseline["metrics_json"]).get("hls_schedule")
@@ -377,6 +409,9 @@ class ForgeDatabase:
             "incumbent_best": incumbent,
             "exploration_state": state,
             "current_source_plans": [_history_item(row, include_status=True) for row in current_rows],
+            "historical_replay_candidates": [
+                _history_item(row, include_status=True) for row in replay_rows
+            ],
             "current_context_summary": {
                 "baseline_score": baseline_score,
                 "best_candidate_score": max(candidate_scores, default=None),
@@ -563,6 +598,7 @@ class ForgeDatabase:
         self._ensure_unified_columns()
         self._migrate_legacy_tables()
         self._ensure_unified_columns()
+        self._backfill_recoverable_fields()
         self._reorder_unified_columns()
         self._create_indexes()
         self.connection.execute("DELETE FROM forge_schema")
@@ -658,6 +694,44 @@ class ForgeDatabase:
             "ON experiments(root_baseline_id, status, efficiency_score DESC)"
         )
 
+    def _backfill_recoverable_fields(self) -> None:
+        """Restore metadata that can be derived without inventing measurements."""
+
+        rows = self.connection.execute(
+            """
+            SELECT id, application, original_source_code, generated_source_code,
+                   original_source_hash, top_function, runtime_ns, performance,
+                   power_w, energy_nj
+            FROM experiments
+            """
+        ).fetchall()
+        for row in rows:
+            source = str(row["original_source_code"] or "")
+            generated = str(row["generated_source_code"] or "") or source
+            source_hash = str(row["original_source_hash"] or "") or hashlib.sha256(
+                source.encode("utf-8")
+            ).hexdigest()
+            top_function = str(row["top_function"] or "") or _infer_top_function(
+                source, str(row["application"] or "")
+            )
+            runtime_ns = row["runtime_ns"]
+            performance = row["performance"]
+            if performance is None and runtime_ns is not None and float(runtime_ns) > 0:
+                performance = 1.0 / float(runtime_ns)
+            power_w = row["power_w"]
+            energy_nj = row["energy_nj"]
+            if energy_nj is None and runtime_ns is not None and power_w is not None:
+                energy_nj = float(runtime_ns) * float(power_w)
+            self.connection.execute(
+                """
+                UPDATE experiments
+                SET generated_source_code = ?, original_source_hash = ?,
+                    top_function = ?, performance = ?, energy_nj = ?
+                WHERE id = ?
+                """,
+                (generated, source_hash, top_function, performance, energy_nj, row["id"]),
+            )
+
     def _migrate_legacy_tables(self) -> None:
         existing = {
             row[0]
@@ -745,7 +819,11 @@ def _history_item(row: sqlite3.Row, include_status: bool = False) -> dict[str, A
     plan = _json_object(row["pragma_plan_json"])
     metrics = _json_object(row["metrics_json"])
     item = {
+        "id": row["id"],
         "source_type": row["source_type"],
+        "application": row["application"],
+        "evaluation_context_key": row["evaluation_context_key"],
+        "original_source_hash": row["original_source_hash"],
         "experiment_set": row["experiment_set"],
         "design_order": row["design_order"],
         "name": row["design_point"],
@@ -770,6 +848,20 @@ def _history_item(row: sqlite3.Row, include_status: bool = False) -> dict[str, A
     if include_status:
         item["status"] = row["status"]
     return item
+
+
+def _infer_top_function(source: str, application: str) -> str:
+    """Infer a missing legacy top name from definitions, preferring the application name."""
+
+    definitions = re.findall(
+        r"(?m)^\s*(?:static\s+)?(?:inline\s+)?"
+        r"(?:void|char|short|int|long(?:\s+long)?|float|double|unsigned(?:\s+\w+)?|signed(?:\s+\w+)?)"
+        r"(?:\s+|\s*\*\s*)([A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{",
+        source,
+    )
+    if application in definitions:
+        return application
+    return definitions[-1] if definitions else ""
 
 
 def _experiment_record(row: sqlite3.Row) -> dict[str, Any]:

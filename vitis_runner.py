@@ -672,7 +672,7 @@ def validate_pragma_effectiveness(
             detail.update({"status": "invalid", "message": message})
             issues.append(message)
         elif directive_name == "PIPELINE":
-            token = _pipeline_loop_token(project, pragma_text)
+            token = _pipeline_loop_token(project, directive)
             result = next(
                 (item for item in pipeline_results if token and token in item["loop"]),
                 None,
@@ -722,17 +722,56 @@ def _pipeline_results(log_text: str) -> list[dict[str, Any]]:
     ]
 
 
-def _pipeline_loop_token(project: Any, pragma_text: str) -> str | None:
+def _pipeline_loop_token(project: Any, directive: dict[str, Any]) -> str | None:
     source_file = Path(getattr(project, "source_file", ""))
     if not source_file.is_file():
         return None
-    lines = source_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+    source_text = source_file.read_text(encoding="utf-8", errors="ignore")
+    target_function = str(directive.get("target_function", ""))
+    target_loop_id = str(directive.get("target_loop_id", ""))
+    loop_match = re.search(r"\.loop_(\d+)$", target_loop_id)
+    if target_function and loop_match:
+        function_match = re.search(
+            rf"\b{re.escape(target_function)}\s*\([^;{{}}]*\)\s*\{{",
+            source_text,
+            flags=re.DOTALL,
+        )
+        if function_match is not None:
+            opening = source_text.find("{", function_match.start())
+            closing = _matching_brace(source_text, opening)
+            if closing is not None:
+                loops = list(re.finditer(
+                    r"\b(?:for|while)\s*\(|\bdo\b",
+                    source_text[opening + 1:closing],
+                ))
+                loop_number = int(loop_match.group(1))
+                if 1 <= loop_number <= len(loops):
+                    position = opening + 1 + loops[loop_number - 1].start()
+                    line_number = source_text.count("\n", 0, position) + 1
+                    return f"VITIS_LOOP_{line_number}_"
+
+    pragma_text = str(directive.get("pragma", ""))
+    lines = source_text.splitlines()
     for index, line in enumerate(lines):
         if line.strip() != pragma_text:
             continue
         for loop_line in range(index - 1, -1, -1):
             if re.search(r"\b(?:for|while)\s*\(|\bdo\b", lines[loop_line]):
                 return f"VITIS_LOOP_{loop_line + 1}_"
+    return None
+
+
+def _matching_brace(text: str, opening: int) -> int | None:
+    if opening < 0 or opening >= len(text) or text[opening] != "{":
+        return None
+    depth = 0
+    for index in range(opening, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return index
     return None
 
 
@@ -769,7 +808,7 @@ def _workspace_directory(project_dir: Path) -> Path:
 
 
 def _workspace_script(project_dir: Path, script_name: str) -> str:
-    return str(Path(project_dir.name) / script_name)
+    return str((project_dir / script_name).resolve())
 
 
 def _power_tcl(top_function: str, part: str, clock_period_ns: float = 10.0) -> str:

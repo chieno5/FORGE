@@ -932,7 +932,8 @@ def _build_tcl(
         "set script_dir [file dirname [info script]]",
         "set workspace_dir [file dirname $script_dir]",
         "cd $workspace_dir",
-        f"open_component -reset {component_name} -flow_target vivado",
+        f"open_component -reset [file join $workspace_dir {{{component_name}}}] "
+        "-flow_target vivado",
         f"set_top {top_function}",
         f"add_files -cflags {{-std=c99}} [file join $script_dir src {{{source_name}}}]",
     ]

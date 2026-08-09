@@ -398,7 +398,9 @@ def _run_cli(argv: list[str], show_banner: bool, config: dict[str, Any]) -> int:
         batch_number = database.reserve_generated_batch(run.id) if args.generate else None
         experience_context = database.history_context(
             application.key,
-            source_text=active_source_text,
+            # History follows the original B0 lineage. The exact evaluation key still
+            # separates a transformed B1 and its frozen-testbench configuration.
+            source_text=source_text,
             evaluation_context_key=evaluation_context_key,
         )
         if args.generate and args.run_vitis:

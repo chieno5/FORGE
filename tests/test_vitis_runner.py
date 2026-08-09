@@ -111,6 +111,51 @@ class VitisRunnerTests(unittest.TestCase):
             self.assertEqual(validation["status"], "passed")
             self.assertEqual(validation["details"][0]["actual_ii"], 1)
 
+    def test_maps_repeated_pipeline_text_to_each_target_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "kernel.c"
+            source.write_text(
+                "void kernel(int input[16], int output[16]) {\n"
+                "    for (int i = 0; i < 16; i++) {\n"
+                "        #pragma HLS PIPELINE II=1\n"
+                "        output[i] = input[i];\n"
+                "    }\n"
+                "    for (int i = 0; i < 16; i++) {\n"
+                "        #pragma HLS PIPELINE II=1\n"
+                "        output[i] += 1;\n"
+                "    }\n}\n",
+                encoding="utf-8",
+            )
+            csynth = root / "csynth.xml"
+            csynth.write_text(
+                "<profile><PragmaReport>"
+                '<Pragma type="pipeline" status="valid"/>'
+                '<Pragma type="pipeline" status="valid"/>'
+                "</PragmaReport></profile>",
+                encoding="utf-8",
+            )
+            log = root / "vitis_hls.log"
+            log.write_text(
+                "Pipelining result : Target II = 1, Final II = 1, Depth = 4, "
+                "loop 'VITIS_LOOP_2_1'\n"
+                "Pipelining result : Target II = 1, Final II = 1, Depth = 3, "
+                "loop 'VITIS_LOOP_6_1'\n",
+                encoding="utf-8",
+            )
+            pragma = "#pragma HLS PIPELINE II=1"
+            project = SimpleNamespace(source_file=str(source), pragmas=[
+                {"pragma": pragma, "target_function": "kernel", "target_loop_id": "kernel.loop_1"},
+                {"pragma": pragma, "target_function": "kernel", "target_loop_id": "kernel.loop_2"},
+            ])
+
+            validation = validate_pragma_effectiveness(project, csynth, log)
+
+            self.assertEqual(
+                [item["hls_loop"] for item in validation["details"]],
+                ["VITIS_LOOP_2_1", "VITIS_LOOP_6_1"],
+            )
+
     def test_rejects_pipeline_that_did_not_create_a_pipelined_loop(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

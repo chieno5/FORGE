@@ -516,7 +516,13 @@ def _extract_function_body(source: str, function_name: str) -> str:
 
 def _defined_function_names(source: str) -> list[str]:
     pattern = re.compile(r"\b([A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{", re.DOTALL)
-    names = [match.group(1) for match in pattern.finditer(_mask_comments_and_strings(source))]
+    masked = _mask_comments_and_strings(source)
+    masked = re.sub(
+        r"(?m)^[ \t]*\#[^\n]*",
+        lambda match: " " * len(match.group(0)),
+        masked,
+    )
+    names = [match.group(1) for match in pattern.finditer(masked)]
     return list(dict.fromkeys(name for name in names if name not in {"if", "for", "while", "switch"}))
 
 

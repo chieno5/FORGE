@@ -8,6 +8,30 @@ from testbench_generator import generate_local_testbench
 
 
 class TestbenchGeneratorTests(unittest.TestCase):
+    def test_expression_macro_is_not_mistaken_for_a_function(self) -> None:
+        source = (
+            "#define BLOCKS 8\n"
+            "#define LANES 4\n"
+            "#define SIZE (BLOCKS * LANES)\n"
+            "void reduction(const int input[SIZE], int output[1]) {\n"
+            "  int sum = 0; for (int i=0;i<SIZE;i++) sum += input[i]; output[0]=sum;\n"
+            "}\n"
+        )
+
+        generated = generate_local_testbench(
+            source,
+            "reduction",
+            FunctionAnalysis(
+                name="reduction",
+                return_type="void",
+                parameters=["const int input[SIZE]", "int output[1]"],
+                features={},
+            ),
+        )
+
+        self.assertNotIn("forge_golden_SIZE", generated.source)
+        self.assertIn("#define reduction forge_golden_reduction", generated.source)
+
     def test_copies_source_defines_needed_by_the_prototype(self) -> None:
         function = FunctionAnalysis(
             name="fir",

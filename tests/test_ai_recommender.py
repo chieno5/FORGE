@@ -59,6 +59,11 @@ class AIRecommendationTests(unittest.TestCase):
             sent["pragma_constraints"]["pipeline_allowed_loop_ids"]["kernel"],
             ["kernel.loop_1", "kernel.loop_2"],
         )
+        self.assertIn(
+            "__forge_",
+            sent["pragma_constraints"]["reserved_generated_identifier_rule"],
+        )
+        self.assertIn("Never target", responses.arguments["instructions"])
 
     def test_parses_and_ranks_solutions(self) -> None:
         result = parse_solution_payload(self._payload(), self._report(), "kernel")
@@ -124,6 +129,65 @@ class AIRecommendationTests(unittest.TestCase):
         ]
         with self.assertRaisesRegex(AIRecommendationError, "loop-carried dependency"):
             parse_solution_payload(payload, report, "kernel")
+
+    def test_allows_bounded_unroll_on_supported_scalar_reduction(self) -> None:
+        report = self._report()
+        report.functions[0].loop_regions[0].features = {
+            "has_loop_carried_dependency": True,
+            "pipeline_eligible": False,
+            "unroll_eligible": False,
+            "dependency_arrays": [],
+            "scalar_recurrences": [{"variable": "sum", "operation": "add"}],
+        }
+        payload = self._payload()
+        payload["solutions"][0]["pragmas"] = [
+            self._pragma("kernel.loop_1", "#pragma HLS UNROLL factor=2"),
+            self._pragma("", "#pragma HLS ARRAY_PARTITION variable=input cyclic factor=2 dim=1"),
+        ]
+        payload["solutions"][0]["rank"] = 1
+        payload["solutions"] = payload["solutions"][:1]
+
+        result = parse_solution_payload(payload, report, "kernel", design_point_count=1)
+
+        self.assertEqual(result[0].pragmas[0].pragma, "#pragma HLS UNROLL factor=2")
+
+        payload["solutions"][0]["pragmas"][0]["pragma"] = "#pragma HLS UNROLL factor=8"
+        with self.assertRaisesRegex(AIRecommendationError, "loop-carried dependency"):
+            parse_solution_payload(payload, report, "kernel", design_point_count=1)
+
+    def test_replays_best_compatible_same_source_plan_without_ai_call(self) -> None:
+        report = self._report()
+        history_plan = self._payload()["solutions"][0]["pragmas"]
+        context = {
+            "current_source_hash": "same-source",
+            "evaluation_context_key": "new-context",
+            "current_source_plans": [],
+            "historical_replay_candidates": [{
+                "name": "old_winner",
+                "efficiency_score": 1.5,
+                "pragmas": history_plan,
+                "pragma_plan": {"strategy": "Previously measured winner."},
+            }],
+        }
+
+        result = recommend_solutions(
+            report,
+            "kernel",
+            part="xc7z020clg400-1",
+            clock_period_ns=10.0,
+            design_point_count=1,
+            model="test-model",
+            experience_context=context,
+            source_text=(
+                "void kernel(int input[16], int output[16]) {\n"
+                "  for (int i=0;i<16;i++) output[i]=input[i];\n"
+                "  for (int i=0;i<16;i++) output[i]+=1;\n"
+                "}\n"
+            ),
+        )
+
+        self.assertIn("historical_replay", result.solutions[0].name)
+        self.assertIn("current frozen testbench", result.summary)
 
     def test_allows_independent_loop_before_nested_loop(self) -> None:
         report = self._report()
@@ -228,6 +292,46 @@ class AIRecommendationTests(unittest.TestCase):
         ]
         with self.assertRaisesRegex(AIRecommendationError, "supplied array parameter"):
             parse_solution_payload(payload, self._report(), "kernel")
+
+    def test_rejects_partition_factor_larger_than_literal_array_extent(self) -> None:
+        report = self._report()
+        report.functions[0].parameters.append("int result[1]")
+        payload = self._payload()
+        payload["solutions"][0]["pragmas"] = [
+            self._pragma("kernel.loop_1", "#pragma HLS PIPELINE II=1"),
+            self._pragma(
+                "",
+                "#pragma HLS ARRAY_PARTITION variable=result cyclic factor=2 dim=1",
+            ),
+        ]
+        with self.assertRaisesRegex(AIRecommendationError, "exceeds the declared"):
+            parse_solution_payload(payload, report, "kernel")
+
+    def test_request_omits_single_element_array_from_partition_targets(self) -> None:
+        report = self._report()
+        report.functions[0].parameters.append("int result[1]")
+        response_payload = self._payload()
+
+        class FakeResponses:
+            def __init__(self) -> None:
+                self.arguments = None
+
+            def create(self, **kwargs):
+                self.arguments = kwargs
+                return SimpleNamespace(output_text=json.dumps(response_payload))
+
+        responses = FakeResponses()
+        recommend_solutions(
+            report,
+            "kernel",
+            part="xc7z020clg400-1",
+            clock_period_ns=10.0,
+            model="test-model",
+            client=SimpleNamespace(responses=responses),
+        )
+        sent = json.loads(responses.arguments["input"])
+        allowed = sent["pragma_constraints"]["array_partition_allowed_variables"]["kernel"]
+        self.assertNotIn("result", allowed)
 
     def test_rejects_unbounded_ai_factors_before_generation(self) -> None:
         payload = self._payload()
@@ -340,6 +444,35 @@ class AIRecommendationTests(unittest.TestCase):
                     self.assertLessEqual(int(factor.group(1)), 8)
                 if ii:
                     self.assertLessEqual(int(ii.group(1)), 4)
+
+    def test_local_fallback_prioritizes_wider_banking_for_many_loop_reads(self) -> None:
+        report = self._report()
+        report.functions[0].loop_regions[0].features["array_access_count"] = 16
+
+        class FakeResponses:
+            def create(self, **_kwargs):
+                return SimpleNamespace(output_text=json.dumps({"summary": "", "solutions": []}))
+
+        result = recommend_solutions(
+            report,
+            "kernel",
+            part="xc7z020clg400-1",
+            clock_period_ns=10.0,
+            design_point_count=2,
+            model="test-model",
+            client=SimpleNamespace(responses=FakeResponses()),
+        )
+
+        partition_pragmas = [
+            next(
+                pragma.pragma
+                for pragma in solution.pragmas
+                if "ARRAY_PARTITION" in pragma.pragma
+            )
+            for solution in result.solutions
+        ]
+        self.assertIn("factor=8", partition_pragmas[0])
+        self.assertIn("factor=4", partition_pragmas[1])
 
     def test_fallback_does_not_duplicate_points_when_safe_space_is_smaller(self) -> None:
         report = AnalysisReport(
