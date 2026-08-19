@@ -56,7 +56,7 @@ PROJECT_NAME = "FORGE: FPGA Optimization and Reconfiguration Generation Engine"
 DEFAULT_THRESHOLD = 60
 REPORT_DIR = Path("report")
 DEFAULT_OUTPUT_ROOT = Path("generated")
-DEFAULT_DATABASE = Path("data") / "forge_test.db"
+DEFAULT_DATABASE = Path("data") / "forge.db"
 CONFIG_PATH = Path("forge.toml")
 ASCII_LOGO = """
  ███████╗ ██████╗ ██████╗  ██████╗ ███████╗

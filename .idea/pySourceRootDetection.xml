@@ -3,7 +3,6 @@
   <component name="PySourceRootDetectionService">
     <option name="sourcePathsSet">
       <set>
-        <option value="$PROJECT_DIR$/.codex_deps_222" />
         <option value="$PROJECT_DIR$" />
       </set>
     </option>

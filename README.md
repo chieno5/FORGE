@@ -43,6 +43,10 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
+`requirements.txt` installs `pycparser`, the OpenAI Python SDK, and
+`python-dotenv`. AMD Vitis HLS and Vivado are external toolchain dependencies;
+install them separately when using `--run-vitis`.
+
 ## Configuration
 
 Copy `.env.example` to `.env` and set only your OpenAI API key:
@@ -162,7 +166,7 @@ python forge.py INPUT [--json FILE] [--verbose]
 | `--vitis-hls PATH` | config/auto | Vitis HLS executable override. |
 | `--vivado PATH` | config/auto | Vivado executable override. |
 | `--amd-root PATH` | config/auto | AMD tool root override. |
-| `--database FILE` | `forge.toml` or `data/forge_test.db` | Local SQLite database override. |
+| `--database FILE` | `forge.toml` or `data/forge.db` | SQLite experiment-history override. |
 
 ## Output
 
@@ -178,18 +182,43 @@ AI recommendation and generation summary:
 report/<source_name>_pragma_report.json
 ```
 
-## Demo Database
+## Formal Experiment Data
 
-Normal FORGE runs and `forge_test.py` use `data/forge_test.db` by default. This
-is the active test and demonstration database. The formal experiment database
-is kept separately as `data/forge.db`.
+The default database is the version-controlled paper artifact
+`data/forge.db`. It contains the five cross-application experiment sets (one B0
+baseline and 15 candidates per application: 5 baselines + 75 candidates) and
+the separate five-point sensor-reduction case (B0, B1, and cyclic bank factors
+2, 4, and 8). Demo, test, backup, and user-created databases are not part of the
+formal artifact and remain ignored by Git.
 
-For a formal demonstration, change `[database].path` in `forge.toml` to
-`data/forge.db`, or override one command with:
+`forge_test.py` deliberately overrides the database path to the ignored
+`data/forge_test.db`, and the unit tests use temporary databases. For local
+experiments that should not modify the paper artifact, pass another ignored
+path explicitly:
 
 ```powershell
-python forge.py examples/fir_filter_example.c --database data/forge.db
+python forge.py examples/fir_filter_example.c --database data/forge_local.db
 ```
+
+### Paper reproduction
+
+The published cross-application measurements and the sensor-reduction
+measurements are stored directly in `data/forge.db`; no demo database is needed.
+The sensor source is `examples/sensor_block_reduction.c`, with top function
+`sum_sensor_blocks`. Its experiment used the deterministic automatic testbench
+with the `full` profile and seed `20260803`, so no generated Vitis project or
+separate input file is required in version control.
+
+To run a fresh local evaluation without altering the committed artifact, use a
+separate database:
+
+```powershell
+python forge.py examples/sensor_block_reduction.c --generate --design-points 3 --top sum_sensor_blocks --auto-testbench --testbench-profile full --testbench-seed 20260803 --run-vitis --database data/sensor_reproduction.db
+```
+
+Fresh AI recommendations or a different Vitis/Vivado installation can produce
+new design points or measurements. The committed database is the authoritative
+record for recalculating the paper tables.
 
 Generated Vitis folders:
 
@@ -250,7 +279,8 @@ When `--run-vitis` is used, FORGE first synthesizes the baseline and adds its
 achieved schedule to the AI context. Each project receives execution logs, HLS
 reports, and a Vivado `power_report.rpt`. FORGE writes the final ranking to the
 pragma report, archives all measurements in the configured database, and
-creates a ZIP archive for the best solution. `data/` is local history and is
+creates a ZIP archive for the best solution. Only the formal
+`data/forge.db` artifact is tracked; other databases and generated outputs are
 ignored by Git.
 Each `--generate` run adds a batch prefix to its source-local project folders, for
 example `generated/fir_filter_example/batch01_baseline/` and
@@ -331,11 +361,11 @@ SQLite has no separate datetime storage class. FORGE therefore stores
 `created_at` and `updated_at` as sortable ISO-8601 UTC text, for example
 `2026-08-06T18:56:15.361007+00:00`.
 
-Import the validated pragma exploration history into the unified experiment
-store:
+To import a separate validated pragma-exploration dataset into a chosen unified
+experiment store:
 
 ```powershell
-python history_importer.py --source-root E:\AMDHLS\FOGRE_Pragma_Explore
+python history_importer.py --source-root PATH\TO\FOGRE_Pragma_Explore --database data/forge_local.db
 ```
 
 The database contains `experiments` and `forge_schema`. Existing legacy
